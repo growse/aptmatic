@@ -147,7 +147,7 @@ pub enum SidebarRow {
 }
 
 fn whoami() -> String {
-    whoami::username()
+    whoami::username().expect("unable to get current user")
 }
 
 #[cfg(test)]
