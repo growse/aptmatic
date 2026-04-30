@@ -10,7 +10,7 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 ssh2 = "0.9"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
