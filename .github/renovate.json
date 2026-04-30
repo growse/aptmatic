@@ -6,6 +6,7 @@
     ":rebaseStalePrs"
   ],
   "assignees": ["growse"],
+  "packageRules": [
     {
       "matchUpdateTypes": ["major"],
       "addLabels": ["major"]
@@ -29,6 +30,5 @@
   "pre-commit": {
     "enabled": true
   },
-  // Don't keep PRs up to date as that invalidates the test check
   "rebaseWhen": "conflicted"
 }
