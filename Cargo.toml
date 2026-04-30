@@ -14,4 +14,4 @@ toml = "1.0"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
-whoami = "1"
+whoami = "2"
