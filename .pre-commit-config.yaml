@@ -18,3 +18,9 @@ repos:
       - id: check-added-large-files
         args: [ '--maxkb=800' ]
       - id: detect-private-key
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+      - id: clippy
+      - id: cargo-check
