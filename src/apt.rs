@@ -11,6 +11,8 @@ pub struct Package {
 pub struct HeldPackage {
     pub name: String,
     pub reason: HoldReason,
+    /// Human-readable explanation of why the package is kept back, if available.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +106,7 @@ pub fn parse_held_manually(output: &str) -> Vec<HeldPackage> {
         .map(|l| HeldPackage {
             name: l.trim().to_string(),
             reason: HoldReason::ManualHold,
+            detail: None,
         })
         .collect()
 }
@@ -129,6 +132,7 @@ pub fn parse_kept_back(output: &str, manually_held: &[HeldPackage]) -> Vec<HeldP
                         pkgs.push(HeldPackage {
                             name: name.to_string(),
                             reason: HoldReason::KeptBack,
+                            detail: None,
                         });
                     }
                 }
@@ -140,10 +144,45 @@ pub fn parse_kept_back(output: &str, manually_held: &[HeldPackage]) -> Vec<HeldP
     pkgs
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Parse output of `LC_ALL=C apt-get -s install <pkg> 2>&1`
+/// Returns `(new_packages, removals)` — packages that would be newly installed
+/// and packages that would be removed, both of which explain why a package is
+/// kept back during a regular `apt upgrade`.
+pub fn parse_install_dry_run(output: &str) -> (Vec<String>, Vec<String>) {
+    let mut new_pkgs: Vec<String> = Vec::new();
+    let mut removals: Vec<String> = Vec::new();
+    let mut in_new = false;
+    let mut in_remove = false;
 
+    for line in output.lines() {
+        if line.contains("NEW packages will be installed") {
+            in_new = true;
+            in_remove = false;
+            continue;
+        }
+        if line.contains("packages will be REMOVED") {
+            in_remove = true;
+            in_new = false;
+            continue;
+        }
+        if line.starts_with("  ") || line.starts_with('\t') {
+            let names = line.split_whitespace().filter(|s| !s.is_empty());
+            if in_new {
+                new_pkgs.extend(names.map(str::to_string));
+            } else if in_remove {
+                removals.extend(names.map(str::to_string));
+            }
+        } else if !line.trim().is_empty() {
+            // Any non-indented non-empty line ends the current section
+            in_new = false;
+            in_remove = false;
+        }
+    }
+
+    (new_pkgs, removals)
+}
+
+mod tests {
     // ── parse_upgradable ──────────────────────────────────────────────────────
 
     #[test]
@@ -266,7 +305,72 @@ ii  live-pkg       2.0          amd64        A live package
         assert_eq!(pkgs[0].name, "linux-image-amd64");
     }
 
-    // ── parse_kept_back ───────────────────────────────────────────────────────
+    // ── parse_install_dry_run ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_install_dry_run_empty() {
+        let (new, rem) = parse_install_dry_run("");
+        assert!(new.is_empty());
+        assert!(rem.is_empty());
+    }
+
+    #[test]
+    fn parse_install_dry_run_new_packages() {
+        let input = "\
+Reading package lists... Done
+Building dependency tree... Done
+The following NEW packages will be installed:
+  linux-image-6.1.0-28-amd64 linux-headers-6.1.0-28-amd64
+The following packages will be upgraded:
+  linux-image-amd64
+1 upgraded, 2 newly installed, 0 to remove and 5 not upgraded.
+";
+        let (new, rem) = parse_install_dry_run(input);
+        assert_eq!(
+            new,
+            vec!["linux-image-6.1.0-28-amd64", "linux-headers-6.1.0-28-amd64"]
+        );
+        assert!(rem.is_empty());
+    }
+
+    #[test]
+    fn parse_install_dry_run_removals() {
+        let input = "\
+Reading package lists... Done
+The following packages will be REMOVED:
+  old-conflicting-pkg
+1 to remove and 0 not upgraded.
+";
+        let (new, rem) = parse_install_dry_run(input);
+        assert!(new.is_empty());
+        assert_eq!(rem, vec!["old-conflicting-pkg"]);
+    }
+
+    #[test]
+    fn parse_install_dry_run_new_and_removals() {
+        let input = "\
+The following NEW packages will be installed:
+  new-dep
+The following packages will be REMOVED:
+  old-dep
+";
+        let (new, rem) = parse_install_dry_run(input);
+        assert_eq!(new, vec!["new-dep"]);
+        assert_eq!(rem, vec!["old-dep"]);
+    }
+
+    #[test]
+    fn parse_install_dry_run_multiline_new_packages() {
+        let input = "\
+The following NEW packages will be installed:
+  pkg-a pkg-b
+  pkg-c
+The following packages will be upgraded:
+  mypkg
+";
+        let (new, _) = parse_install_dry_run(input);
+        assert_eq!(new, vec!["pkg-a", "pkg-b", "pkg-c"]);
+    }
 
     #[test]
     fn parse_kept_back_empty_output() {
@@ -314,6 +418,7 @@ Inst pkg-d
         let manually_held = vec![HeldPackage {
             name: "linux-image-amd64".to_string(),
             reason: HoldReason::ManualHold,
+            detail: None,
         }];
         let input = "\
 The following packages have been kept back:

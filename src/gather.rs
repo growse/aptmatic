@@ -1,7 +1,8 @@
 use anyhow::Result;
 
 use crate::apt::{
-    HostInfo, parse_held_manually, parse_kept_back, parse_rc_packages, parse_upgradable,
+    HostInfo, parse_held_manually, parse_install_dry_run, parse_kept_back, parse_rc_packages,
+    parse_upgradable,
 };
 use crate::config::HostConfig;
 use crate::ssh::SshSession;
@@ -61,6 +62,28 @@ pub fn gather(cfg: &HostConfig) -> Result<HostInfo> {
 
     let mut held_packages = manual_held;
     held_packages.extend(kept_back);
+
+    // For each kept-back package, run a dry-run install to discover why it
+    // cannot be upgraded with a plain `apt upgrade` (e.g. new deps needed).
+    for pkg in held_packages
+        .iter_mut()
+        .filter(|p| p.reason == crate::apt::HoldReason::KeptBack)
+    {
+        let install_sim = sess
+            .exec(&format!("{LC} apt-get -s install {} 2>&1", pkg.name))
+            .unwrap_or_default();
+        let (new_deps, removals) = parse_install_dry_run(&install_sim);
+        let mut parts: Vec<String> = Vec::new();
+        if !new_deps.is_empty() {
+            parts.push(format!("needs: {}", new_deps.join(", ")));
+        }
+        if !removals.is_empty() {
+            parts.push(format!("removes: {}", removals.join(", ")));
+        }
+        if !parts.is_empty() {
+            pkg.detail = Some(parts.join("; "));
+        }
+    }
 
     Ok(HostInfo {
         running_kernel,

@@ -304,7 +304,11 @@ fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
                         Span::styled("[manual hold]", Style::default().fg(Color::Yellow))
                     }
                     HoldReason::KeptBack => {
-                        Span::styled("[kept back]", Style::default().fg(Color::Magenta))
+                        let label = match &pkg.detail {
+                            Some(d) => format!("[kept back: {d}]"),
+                            None => "[kept back]".to_string(),
+                        };
+                        Span::styled(label, Style::default().fg(Color::Magenta))
                     }
                 };
                 lines.push(Line::from(vec![
