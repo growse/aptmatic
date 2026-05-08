@@ -249,11 +249,12 @@ fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
             Span::styled(&info.running_kernel, Style::default().fg(Color::White)),
         ]));
         if let Some(latest) = &info.latest_kernel {
-            let pending = latest.trim_start_matches("linux-image-") != info.running_kernel;
+            let latest_ver = latest.trim_start_matches("linux-image-");
+            let pending = latest_ver != info.running_kernel;
             if pending {
                 lines.push(Line::from(vec![
                     Span::raw("  Latest:  "),
-                    Span::styled(latest, Style::default().fg(Color::Yellow)),
+                    Span::styled(latest_ver, Style::default().fg(Color::Yellow)),
                     Span::styled(
                         " ← reboot to activate",
                         Style::default().fg(Color::DarkGray),
@@ -262,7 +263,7 @@ fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
             } else {
                 lines.push(Line::from(vec![
                     Span::raw("  Latest:  "),
-                    Span::styled(latest, Style::default().fg(Color::Green)),
+                    Span::styled(latest_ver, Style::default().fg(Color::Green)),
                 ]));
             }
         }

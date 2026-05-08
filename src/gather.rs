@@ -21,7 +21,7 @@ pub fn gather(cfg: &HostConfig) -> Result<HostInfo> {
     let latest_kernel = {
         let out = sess
             .exec(&format!(
-                "{LC} dpkg -l linux-image-[0-9]* 2>/dev/null | awk '/^ii/{{print $3}}' | sort -V | tail -1"
+                "{LC} dpkg -l linux-image-[0-9]* 2>/dev/null | awk '/^ii/{{print $2}}' | sort -V | tail -1"
             ))
             .unwrap_or_default();
         let v = out.trim().to_string();
