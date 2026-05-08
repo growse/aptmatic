@@ -17,31 +17,35 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_task_view(f, app, host_idx);
     } else {
         let area = f.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(area);
 
-        render_title_bar(f, chunks[0]);
+        if app.detail_zoom {
+            // Full-screen borderless detail: no title bar, no status bar, no block border,
+            // so Shift+select copies only content.
+            render_detail(f, app, area, true);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(area);
 
-        let body = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(if app.detail_zoom {
-                vec![Constraint::Length(0), Constraint::Min(0)]
-            } else {
-                vec![Constraint::Length(app.sidebar_width), Constraint::Min(0)]
-            })
-            .split(chunks[1]);
+            render_title_bar(f, chunks[0]);
 
-        if !app.detail_zoom {
+            let body = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(vec![
+                    Constraint::Length(app.sidebar_width),
+                    Constraint::Min(0),
+                ])
+                .split(chunks[1]);
+
             render_sidebar(f, app, body[0]);
+            render_detail(f, app, body[1], false);
+            render_status_bar(f, app, chunks[2]);
         }
-        render_detail(f, app, body[1]);
-        render_status_bar(f, app, chunks[2]);
     }
 
     if let Some(state) = &app.reboot_confirm {
@@ -169,11 +173,16 @@ fn host_indicator(h: &crate::app::HostState, tick: u64) -> String {
     }
 }
 
-fn render_detail(f: &mut Frame, app: &App, area: Rect) {
+fn render_detail(f: &mut Frame, app: &App, area: Rect, borderless: bool) {
     let indices = app.selected_host_indices();
-    let block = Block::default().borders(Borders::ALL).title(" Detail ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let inner = if borderless {
+        area
+    } else {
+        let block = Block::default().borders(Borders::ALL).title(" Detail ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner
+    };
 
     if indices.is_empty() {
         let p = Paragraph::new("No selection");
