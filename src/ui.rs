@@ -66,7 +66,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|h| matches!(h.status, HostStatus::Connecting | HostStatus::Gathering))
         .count();
-    let hint = " r:refresh  R:refresh all  b:reboot  u:update  U:upgrade  p:purge-rc  t:task output  z:zoom  q:quit";
+    let hint = " r:update+refresh  R:update+refresh all  b:reboot  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all  p:purge-rc  t:task output  z:zoom  q:quit";
     let status = if running > 0 {
         format!(" [{running} refreshing…]{hint}")
     } else {

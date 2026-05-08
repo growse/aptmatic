@@ -60,6 +60,7 @@ pub enum HostStatus {
 pub enum TaskKind {
     Update,
     Upgrade,
+    FullUpgrade,
     PurgeRc,
     Reboot,
 }
@@ -69,6 +70,7 @@ impl TaskKind {
         match self {
             TaskKind::Update => "apt-get update",
             TaskKind::Upgrade => "apt-get upgrade",
+            TaskKind::FullUpgrade => "apt-get full-upgrade",
             TaskKind::PurgeRc => "purge RC packages",
             TaskKind::Reboot => "reboot",
         }
@@ -82,6 +84,11 @@ impl TaskKind {
             }
             TaskKind::Upgrade => {
                 format!("DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y upgrade 2>&1")
+            }
+            TaskKind::FullUpgrade => {
+                format!(
+                    "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y full-upgrade 2>&1"
+                )
             }
             TaskKind::PurgeRc => format!(
                 r#"pkgs=$(LC_ALL=C dpkg -l | awk '/^rc/{{print $2}}'); [ -n "$pkgs" ] && echo "$pkgs" | xargs {sudo}dpkg --purge 2>&1 || echo "No RC packages to purge""#
@@ -349,18 +356,16 @@ impl App {
             {
                 self.selected_row += 1;
             }
-            // Refresh selection
+            // apt-get update + refresh (selected)
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
                 for idx in self.selected_host_indices() {
-                    self.hosts[idx].status = HostStatus::Gathering;
-                    self.start_refresh(idx);
+                    self.start_task(idx, TaskKind::Update);
                 }
             }
-            // Refresh all
+            // apt-get update + refresh (all)
             (KeyCode::Char('R'), _) => {
                 for idx in 0..self.hosts.len() {
-                    self.hosts[idx].status = HostStatus::Gathering;
-                    self.start_refresh(idx);
+                    self.start_task(idx, TaskKind::Update);
                 }
             }
             // Reboot — opens confirmation modal for single-host selection
@@ -372,16 +377,28 @@ impl App {
                     mismatch: false,
                 });
             }
-            // apt-get update
+            // apt-get upgrade (selected)
             (KeyCode::Char('u'), KeyModifiers::NONE) => {
                 for idx in self.selected_host_indices() {
-                    self.start_task(idx, TaskKind::Update);
+                    self.start_task(idx, TaskKind::Upgrade);
                 }
             }
-            // apt-get upgrade
+            // apt-get upgrade (all)
             (KeyCode::Char('U'), _) => {
-                for idx in self.selected_host_indices() {
+                for idx in 0..self.hosts.len() {
                     self.start_task(idx, TaskKind::Upgrade);
+                }
+            }
+            // apt-get full-upgrade (selected)
+            (KeyCode::Char('f'), KeyModifiers::NONE) => {
+                for idx in self.selected_host_indices() {
+                    self.start_task(idx, TaskKind::FullUpgrade);
+                }
+            }
+            // apt-get full-upgrade (all)
+            (KeyCode::Char('F'), _) => {
+                for idx in 0..self.hosts.len() {
+                    self.start_task(idx, TaskKind::FullUpgrade);
                 }
             }
             // Purge RC packages
@@ -627,6 +644,38 @@ mod tests {
         let cmd = TaskKind::Upgrade.command(false);
         assert!(!cmd.contains("sudo"));
         assert!(cmd.contains("apt-get") && cmd.contains("upgrade"));
+    }
+
+    #[test]
+    fn task_kind_full_upgrade_label() {
+        assert_eq!(TaskKind::FullUpgrade.label(), "apt-get full-upgrade");
+    }
+
+    #[test]
+    fn task_kind_command_full_upgrade_with_sudo() {
+        let cmd = TaskKind::FullUpgrade.command(true);
+        assert!(cmd.contains("sudo -n"));
+        assert!(cmd.contains("apt-get") && cmd.contains("full-upgrade"));
+    }
+
+    #[test]
+    fn task_kind_command_full_upgrade_without_sudo() {
+        let cmd = TaskKind::FullUpgrade.command(false);
+        assert!(!cmd.contains("sudo"));
+        assert!(cmd.contains("apt-get") && cmd.contains("full-upgrade"));
+    }
+
+    #[test]
+    fn task_kind_command_full_upgrade_is_noninteractive() {
+        let cmd = TaskKind::FullUpgrade.command(false);
+        assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
+    }
+
+    #[test]
+    fn task_kind_command_full_upgrade_not_same_as_upgrade() {
+        let upgrade = TaskKind::Upgrade.command(false);
+        let full_upgrade = TaskKind::FullUpgrade.command(false);
+        assert_ne!(upgrade, full_upgrade);
     }
 
     #[test]
