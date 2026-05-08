@@ -238,8 +238,14 @@ impl App {
         });
     }
 
-    /// Trigger an apt task on one host.
+    /// Trigger an apt task on one host. Does nothing if a task is already running.
     pub fn start_task(&mut self, host_idx: usize, kind: TaskKind) {
+        if matches!(
+            self.hosts[host_idx].task.as_ref().map(|t| &t.status),
+            Some(TaskStatus::Running)
+        ) {
+            return;
+        }
         let cfg = self.hosts[host_idx].cfg.clone();
         let tx = self.tx.clone();
         let cmd = kind.command(cfg.use_sudo);
