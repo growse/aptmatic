@@ -61,6 +61,7 @@ pub enum TaskKind {
     Update,
     Upgrade,
     FullUpgrade,
+    AutoRemove,
     PurgeRc,
     Reboot,
 }
@@ -71,6 +72,7 @@ impl TaskKind {
             TaskKind::Update => "apt-get update",
             TaskKind::Upgrade => "apt-get upgrade",
             TaskKind::FullUpgrade => "apt-get full-upgrade",
+            TaskKind::AutoRemove => "apt-get autoremove --purge",
             TaskKind::PurgeRc => "purge RC packages",
             TaskKind::Reboot => "reboot",
         }
@@ -88,6 +90,11 @@ impl TaskKind {
             TaskKind::FullUpgrade => {
                 format!(
                     "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y full-upgrade 2>&1"
+                )
+            }
+            TaskKind::AutoRemove => {
+                format!(
+                    "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y autoremove --purge 2>&1"
                 )
             }
             TaskKind::PurgeRc => format!(
@@ -401,6 +408,18 @@ impl App {
                     self.start_task(idx, TaskKind::FullUpgrade);
                 }
             }
+            // apt-get autoremove --purge (selected)
+            (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                for idx in self.selected_host_indices() {
+                    self.start_task(idx, TaskKind::AutoRemove);
+                }
+            }
+            // apt-get autoremove --purge (all)
+            (KeyCode::Char('A'), _) => {
+                for idx in 0..self.hosts.len() {
+                    self.start_task(idx, TaskKind::AutoRemove);
+                }
+            }
             // Purge RC packages
             (KeyCode::Char('p'), KeyModifiers::NONE) => {
                 for idx in self.selected_host_indices() {
@@ -676,6 +695,31 @@ mod tests {
         let upgrade = TaskKind::Upgrade.command(false);
         let full_upgrade = TaskKind::FullUpgrade.command(false);
         assert_ne!(upgrade, full_upgrade);
+    }
+
+    #[test]
+    fn task_kind_autoremove_label() {
+        assert_eq!(TaskKind::AutoRemove.label(), "apt-get autoremove --purge");
+    }
+
+    #[test]
+    fn task_kind_command_autoremove_with_sudo() {
+        let cmd = TaskKind::AutoRemove.command(true);
+        assert!(cmd.contains("sudo -n"));
+        assert!(cmd.contains("autoremove") && cmd.contains("--purge"));
+    }
+
+    #[test]
+    fn task_kind_command_autoremove_without_sudo() {
+        let cmd = TaskKind::AutoRemove.command(false);
+        assert!(!cmd.contains("sudo"));
+        assert!(cmd.contains("autoremove") && cmd.contains("--purge"));
+    }
+
+    #[test]
+    fn task_kind_command_autoremove_is_noninteractive() {
+        let cmd = TaskKind::AutoRemove.command(false);
+        assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
     }
 
     #[test]
