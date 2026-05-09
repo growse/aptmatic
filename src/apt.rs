@@ -182,7 +182,10 @@ pub fn parse_install_dry_run(output: &str) -> (Vec<String>, Vec<String>) {
     (new_pkgs, removals)
 }
 
+#[cfg(test)]
 mod tests {
+    use super::*;
+
     // ── parse_upgradable ──────────────────────────────────────────────────────
 
     #[test]
