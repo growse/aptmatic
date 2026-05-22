@@ -225,15 +225,8 @@ fn render_group_detail(f: &mut Frame, app: &App, indices: &[usize], area: Rect) 
 fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
     let h = &app.hosts[host_idx];
 
-    // Dynamically collapse panels that have nothing to show.
-    let autoremove_count = h.info.as_ref().map(|i| i.autoremovable.len()).unwrap_or(0);
-    let autoremove_height = if autoremove_count > 0 {
-        Constraint::Fill(1)
-    } else {
-        Constraint::Length(3) // border + "none" + border
-    };
     let task_height = if h.task.is_some() {
-        Constraint::Fill(2)
+        Constraint::Fill(3)
     } else {
         Constraint::Length(3)
     };
@@ -243,17 +236,23 @@ fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
         .constraints([
             Constraint::Length(3), // host header
             Constraint::Length(6), // kernel
-            Constraint::Fill(2),   // upgradable + held + RC
-            autoremove_height,     // autoremovable
+            Constraint::Fill(1),   // upgradable + autoremovable side-by-side
             task_height,           // live task output
         ])
         .split(area);
 
     render_host_header(f, h, panes[0]);
     render_kernel_panel(f, h, panes[1]);
-    render_upgradable_panel(f, h, panes[2]);
-    render_autoremovable_panel(f, h, panes[3]);
-    render_task_panel(f, app, host_idx, panes[4]);
+
+    // Upgradable and autoremovable side-by-side
+    let pkg_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(2), Constraint::Fill(1)])
+        .split(panes[2]);
+    render_upgradable_panel(f, h, pkg_row[0]);
+    render_autoremovable_panel(f, h, pkg_row[1]);
+
+    render_task_panel(f, app, host_idx, panes[3]);
 }
 
 fn render_host_header(f: &mut Frame, h: &crate::app::HostState, area: Rect) {
