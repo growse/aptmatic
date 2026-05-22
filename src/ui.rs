@@ -28,7 +28,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
                 .constraints([
                     Constraint::Length(1),
                     Constraint::Min(0),
-                    Constraint::Length(1),
+                    Constraint::Length(2),
                 ])
                 .split(area);
 
@@ -70,13 +70,21 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .filter(|h| matches!(h.status, HostStatus::Connecting | HostStatus::Gathering))
         .count();
-    let hint = " r:update+refresh  R:update+refresh all  b:reboot  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all  a:autoremove  A:autoremove all  p:purge-rc  t:task output  z:zoom  q:quit";
-    let status = if running > 0 {
-        format!(" [{running} refreshing…]{hint}")
+    let refresh_status = if running > 0 {
+        format!(" [{running} refreshing…]  ")
     } else {
-        format!(" {hint}")
+        String::new()
     };
-    let bar = Paragraph::new(status).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let line1 = format!(
+        "{refresh_status}r:update+refresh  R:update+refresh all  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all"
+    );
+    let line2 =
+        " a:autoremove  A:autoremove all  p:purge-rc  b:reboot  t:task output  z:zoom  q:quit";
+    let text = vec![
+        Line::from(Span::raw(format!(" {line1}"))),
+        Line::from(Span::raw(line2)),
+    ];
+    let bar = Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(bar, area);
 }
 
