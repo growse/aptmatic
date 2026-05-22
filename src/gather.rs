@@ -1,8 +1,8 @@
 use anyhow::Result;
 
 use crate::apt::{
-    HostInfo, parse_held_manually, parse_install_dry_run, parse_kept_back, parse_rc_packages,
-    parse_upgradable,
+    HostInfo, parse_autoremovable, parse_held_manually, parse_install_dry_run, parse_kept_back,
+    parse_rc_packages, parse_upgradable,
 };
 use crate::config::HostConfig;
 use crate::ssh::SshSession;
@@ -85,6 +85,14 @@ pub fn gather(cfg: &HostConfig) -> Result<HostInfo> {
         }
     }
 
+    // Packages eligible for autoremove
+    let autoremove_out = sess
+        .exec(&format!(
+            "{LC} {sudo}apt-get -s autoremove --purge 2>/dev/null"
+        ))
+        .unwrap_or_default();
+    let autoremovable = parse_autoremovable(&autoremove_out);
+
     Ok(HostInfo {
         running_kernel,
         latest_kernel,
@@ -92,5 +100,6 @@ pub fn gather(cfg: &HostConfig) -> Result<HostInfo> {
         upgradable,
         rc_packages,
         held_packages,
+        autoremovable,
     })
 }

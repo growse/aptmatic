@@ -38,6 +38,7 @@ pub struct HostInfo {
     pub upgradable: Vec<Package>,
     pub rc_packages: Vec<RcPackage>,
     pub held_packages: Vec<HeldPackage>,
+    pub autoremovable: Vec<String>,
 }
 
 /// Parse output of `LC_ALL=C apt list --upgradable 2>/dev/null`
@@ -180,6 +181,31 @@ pub fn parse_install_dry_run(output: &str) -> (Vec<String>, Vec<String>) {
     }
 
     (new_pkgs, removals)
+}
+
+/// Parse output of `LC_ALL=C apt-get -s autoremove --purge 2>/dev/null`
+/// Returns package names listed under "The following packages will be REMOVED:".
+pub fn parse_autoremovable(output: &str) -> Vec<String> {
+    let mut packages = Vec::new();
+    let mut in_removed = false;
+
+    for line in output.lines() {
+        if line.contains("packages will be REMOVED:") {
+            in_removed = true;
+            continue;
+        }
+        if in_removed {
+            if line.starts_with("  ") || line.starts_with('\t') {
+                packages.extend(
+                    line.split_whitespace()
+                        .map(|s| s.trim_end_matches('*').to_string()),
+                );
+            } else {
+                in_removed = false;
+            }
+        }
+    }
+    packages
 }
 
 #[cfg(test)]
@@ -373,6 +399,54 @@ The following packages will be upgraded:
 ";
         let (new, _) = parse_install_dry_run(input);
         assert_eq!(new, vec!["pkg-a", "pkg-b", "pkg-c"]);
+    }
+
+    // ── parse_autoremovable ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_autoremovable_empty() {
+        assert!(parse_autoremovable("").is_empty());
+    }
+
+    #[test]
+    fn parse_autoremovable_no_removed_section() {
+        let input = "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
+        assert!(parse_autoremovable(input).is_empty());
+    }
+
+    #[test]
+    fn parse_autoremovable_single_line() {
+        let input = "\
+Reading package lists... Done
+Building dependency tree... Done
+The following packages will be REMOVED:
+  libfoo1 libbar2 libbaz3
+0 upgraded, 0 newly installed, 3 to remove and 0 not upgraded.
+";
+        let pkgs = parse_autoremovable(input);
+        assert_eq!(pkgs, vec!["libfoo1", "libbar2", "libbaz3"]);
+    }
+
+    #[test]
+    fn parse_autoremovable_multiline() {
+        let input = "\
+The following packages will be REMOVED:
+  pkg-a pkg-b
+  pkg-c
+0 to remove.
+";
+        let pkgs = parse_autoremovable(input);
+        assert_eq!(pkgs, vec!["pkg-a", "pkg-b", "pkg-c"]);
+    }
+
+    #[test]
+    fn parse_autoremovable_strips_asterisk_suffixes() {
+        let input = "\
+The following packages will be REMOVED:
+  libfoo1* libbar2*
+";
+        let pkgs = parse_autoremovable(input);
+        assert_eq!(pkgs, vec!["libfoo1", "libbar2"]);
     }
 
     #[test]

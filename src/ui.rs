@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
 use crate::app::{App, HostStatus, TaskStatus};
@@ -218,43 +218,82 @@ fn render_group_detail(f: &mut Frame, app: &App, indices: &[usize], area: Rect) 
             Span::styled(status_str, Style::default().fg(Color::Gray)),
         ]));
     }
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines);
     f.render_widget(p, area);
 }
 
 fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
     let h = &app.hosts[host_idx];
 
+    // Dynamically collapse panels that have nothing to show.
+    let autoremove_count = h.info.as_ref().map(|i| i.autoremovable.len()).unwrap_or(0);
+    let autoremove_height = if autoremove_count > 0 {
+        Constraint::Fill(1)
+    } else {
+        Constraint::Length(3) // border + "none" + border
+    };
+    let task_height = if h.task.is_some() {
+        Constraint::Fill(2)
+    } else {
+        Constraint::Length(3)
+    };
+
+    let panes = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // host header
+            Constraint::Length(6), // kernel
+            Constraint::Fill(2),   // upgradable + held + RC
+            autoremove_height,     // autoremovable
+            task_height,           // live task output
+        ])
+        .split(area);
+
+    render_host_header(f, h, panes[0]);
+    render_kernel_panel(f, h, panes[1]);
+    render_upgradable_panel(f, h, panes[2]);
+    render_autoremovable_panel(f, h, panes[3]);
+    render_task_panel(f, app, host_idx, panes[4]);
+}
+
+fn render_host_header(f: &mut Frame, h: &crate::app::HostState, area: Rect) {
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", h.cfg.hostname),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  user: {}  port: {}  sudo: {}",
+                    h.cfg.user, h.cfg.port, h.cfg.use_sudo
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" Status: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(host_status_str(h), status_color(&h.status)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_kernel_panel(f: &mut Frame, h: &crate::app::HostState, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Kernel ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     let mut lines: Vec<Line> = Vec::new();
-
-    // Header
-    lines.push(Line::from(Span::styled(
-        format!(" {}", h.cfg.hostname),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            " user: {}  port: {}  sudo: {}",
-            h.cfg.user, h.cfg.port, h.cfg.use_sudo
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::raw(""));
-
-    // Status line
-    lines.push(Line::from(vec![
-        Span::styled(" Status: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(host_status_str(h), status_color(&h.status)),
-    ]));
-    lines.push(Line::raw(""));
-
     if let Some(info) = &h.info {
-        // Kernel
-        lines.push(section_header("Kernel"));
         lines.push(Line::from(vec![
-            Span::raw("  Running: "),
+            Span::raw(" Running: "),
             Span::styled(&info.running_kernel, Style::default().fg(Color::White)),
         ]));
         if let Some(latest) = &info.latest_kernel {
@@ -262,7 +301,7 @@ fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
             let pending = latest_ver != info.running_kernel;
             if pending {
                 lines.push(Line::from(vec![
-                    Span::raw("  Latest:  "),
+                    Span::raw(" Latest:  "),
                     Span::styled(latest_ver, Style::default().fg(Color::Yellow)),
                     Span::styled(
                         " ← reboot to activate",
@@ -271,111 +310,206 @@ fn render_host_detail(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
                 ]));
             } else {
                 lines.push(Line::from(vec![
-                    Span::raw("  Latest:  "),
+                    Span::raw(" Latest:  "),
                     Span::styled(latest_ver, Style::default().fg(Color::Green)),
                 ]));
             }
         }
         if info.reboot_required {
             lines.push(Line::from(Span::styled(
-                "  ⚠ Reboot required",
+                " ⚠ Reboot required",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )));
         }
-        lines.push(Line::raw(""));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " gathering…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
-        // Upgradable packages
-        lines.push(section_header(if info.upgradable.is_empty() {
-            "Upgradable: none"
-        } else {
-            "Upgradable"
-        }));
-        for pkg in &info.upgradable {
-            let from = pkg
-                .current_version
-                .as_deref()
-                .map(|v| format!(" ({v} →)"))
-                .unwrap_or_default();
-            lines.push(Line::from(vec![
-                Span::raw(format!("  {}{from} ", pkg.name)),
-                Span::styled(&pkg.new_version, Style::default().fg(Color::Cyan)),
-            ]));
+fn render_upgradable_panel(f: &mut Frame, h: &crate::app::HostState, area: Rect) {
+    let info = match &h.info {
+        Some(i) => i,
+        None => {
+            let block = Block::default().borders(Borders::ALL).title(" Upgradable ");
+            f.render_widget(block, area);
+            return;
         }
-        lines.push(Line::raw(""));
+    };
 
-        // Held / kept-back packages
-        if !info.held_packages.is_empty() {
-            lines.push(section_header("Held / kept back"));
-            for pkg in &info.held_packages {
-                let reason = match pkg.reason {
-                    HoldReason::ManualHold => {
-                        Span::styled("[manual hold]", Style::default().fg(Color::Yellow))
-                    }
-                    HoldReason::KeptBack => {
-                        let label = match &pkg.detail {
-                            Some(d) => format!("[kept back: {d}]"),
-                            None => "[kept back]".to_string(),
-                        };
-                        Span::styled(label, Style::default().fg(Color::Magenta))
-                    }
-                };
-                lines.push(Line::from(vec![
-                    Span::raw(format!("  {} ", pkg.name)),
-                    reason,
-                ]));
-            }
+    let title = if info.upgradable.is_empty() {
+        " Upgradable: none ".to_string()
+    } else {
+        format!(" Upgradable ({}) ", info.upgradable.len())
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for pkg in &info.upgradable {
+        let from = pkg
+            .current_version
+            .as_deref()
+            .map(|v| format!(" ({v} →)"))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::raw(format!(" {}{from} ", pkg.name)),
+            Span::styled(&pkg.new_version, Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    if !info.held_packages.is_empty() {
+        if !lines.is_empty() {
             lines.push(Line::raw(""));
         }
-
-        // RC packages
-        if !info.rc_packages.is_empty() {
-            lines.push(section_header(&format!(
-                "RC packages ({})",
-                info.rc_packages.len()
-            )));
-            for pkg in &info.rc_packages {
-                lines.push(Line::from(Span::raw(format!("  {}", pkg.name))));
-            }
-            lines.push(Line::from(Span::styled(
-                "  Press p to purge",
-                Style::default().fg(Color::DarkGray),
-            )));
+        lines.push(section_header(&format!(
+            "Held / kept back ({})",
+            info.held_packages.len()
+        )));
+        for pkg in &info.held_packages {
+            let reason = match pkg.reason {
+                HoldReason::ManualHold => {
+                    Span::styled("[manual hold]", Style::default().fg(Color::Yellow))
+                }
+                HoldReason::KeptBack => {
+                    let label = match &pkg.detail {
+                        Some(d) => format!("[kept back: {d}]"),
+                        None => "[kept back]".to_string(),
+                    };
+                    Span::styled(label, Style::default().fg(Color::Magenta))
+                }
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {} ", pkg.name)),
+                reason,
+            ]));
         }
-    } else if let HostStatus::Error(e) = &h.status {
+    }
+
+    if !info.rc_packages.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(section_header(&format!(
+            "RC packages ({})",
+            info.rc_packages.len()
+        )));
+        for pkg in &info.rc_packages {
+            lines.push(Line::from(Span::raw(format!("  {}", pkg.name))));
+        }
         lines.push(Line::from(Span::styled(
-            format!("  {e}"),
-            Style::default().fg(Color::Red),
+            "  Press p to purge",
+            Style::default().fg(Color::DarkGray),
         )));
     }
 
-    // Task hint if one is running
-    if let Some(task) = &h.task {
-        lines.push(Line::raw(""));
-        let task_label = match &task.status {
-            TaskStatus::Running => Span::styled(
-                format!("⟳ {} running… (t to view)", task.kind.label()),
-                Style::default().fg(Color::Yellow),
-            ),
-            TaskStatus::Done(0) => Span::styled(
-                format!("✓ {} done (t to view)", task.kind.label()),
-                Style::default().fg(Color::Green),
-            ),
-            TaskStatus::Done(code) => Span::styled(
-                format!("✗ {} exited {code} (t to view)", task.kind.label()),
-                Style::default().fg(Color::Red),
-            ),
-            TaskStatus::Failed(e) => Span::styled(
-                format!("✗ {}: {e}", task.kind.label()),
-                Style::default().fg(Color::Red),
-            ),
-        };
-        lines.push(Line::from(task_label));
-    }
+    // Scroll to show as many lines as fit; excess lines overflow silently.
+    let visible = inner.height as usize;
+    let total = lines.len();
+    let scroll = total.saturating_sub(visible) as u16;
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+}
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(p, area);
+fn render_autoremovable_panel(f: &mut Frame, h: &crate::app::HostState, area: Rect) {
+    let pkgs = h.info.as_ref().map(|i| &i.autoremovable);
+
+    let title = match pkgs {
+        None => " Autoremovable ".to_string(),
+        Some(v) if v.is_empty() => " Autoremovable: none ".to_string(),
+        Some(v) => format!(" Autoremovable ({}) ", v.len()),
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(pkgs) = pkgs
+        && !pkgs.is_empty()
+    {
+        let lines: Vec<Line> = pkgs
+            .iter()
+            .map(|name| Line::from(Span::raw(format!(" {name}"))))
+            .collect();
+        let visible = inner.height as usize;
+        let scroll = lines.len().saturating_sub(visible) as u16;
+        f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+    }
+}
+
+fn render_task_panel(f: &mut Frame, app: &App, host_idx: usize, area: Rect) {
+    let h = &app.hosts[host_idx];
+
+    let (title, status_line) = match &h.task {
+        None => {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Task output: none ");
+            f.render_widget(block, area);
+            return;
+        }
+        Some(task) => {
+            let status = match &task.status {
+                TaskStatus::Running => {
+                    let sp = SPINNER[(app.tick / 2) as usize % SPINNER.len()];
+                    format!("{sp} {} running…  t:full view", task.kind.label())
+                }
+                TaskStatus::Done(0) => {
+                    format!("✓ {} done  t:full view", task.kind.label())
+                }
+                TaskStatus::Done(code) => {
+                    format!("✗ {} exited {code}  t:full view", task.kind.label())
+                }
+                TaskStatus::Failed(e) => {
+                    format!("✗ {}: {e}  t:full view", task.kind.label())
+                }
+            };
+            let title = format!(" Task: {} ", task.kind.label());
+            (title, status)
+        }
+    };
+
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let task = h.task.as_ref().unwrap();
+
+    // Status line at top of panel
+    let status_style = match &task.status {
+        TaskStatus::Running => Style::default().fg(Color::Yellow),
+        TaskStatus::Done(0) => Style::default().fg(Color::Green),
+        _ => Style::default().fg(Color::Red),
+    };
+
+    // Reserve one row for status line, rest for output
+    let output_rows = inner.height.saturating_sub(1) as usize;
+    let total = task.output.len();
+    let start = total.saturating_sub(output_rows);
+    let output_lines: Vec<Line> = task
+        .output
+        .range(start..)
+        .map(|l| Line::from(Span::raw(l.as_str())))
+        .collect();
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {status_line}"),
+            status_style,
+        ))),
+        layout[0],
+    );
+    f.render_widget(Paragraph::new(output_lines), layout[1]);
 }
 
 fn render_task_view(f: &mut Frame, app: &App, host_idx: usize) {
