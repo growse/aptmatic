@@ -42,7 +42,7 @@ A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts â
 ## Installation
 
 ```bash
-cargo install --path .
+cargo install aptmatic
 ```
 
 Or build from source:
