@@ -192,6 +192,8 @@ pub struct App {
     pub dragging_sidebar: bool,
     /// When Some, the reboot confirmation modal is active.
     pub reboot_confirm: Option<RebootConfirmState>,
+    /// When true, the quit confirmation modal is active (shown when tasks are still running).
+    pub quit_confirm: bool,
 }
 
 impl App {
@@ -218,7 +220,21 @@ impl App {
             },
             dragging_sidebar: false,
             reboot_confirm: None,
+            quit_confirm: false,
         }
+    }
+
+    /// Number of hosts with a task currently in progress.
+    pub fn running_task_count(&self) -> usize {
+        self.hosts
+            .iter()
+            .filter(|h| {
+                matches!(
+                    h.task.as_ref().map(|t| &t.status),
+                    Some(TaskStatus::Running)
+                )
+            })
+            .count()
     }
 
     /// Indices of all hosts under the currently selected sidebar row.
@@ -340,8 +356,15 @@ impl App {
         }
     }
 
+    /// Handle a key press. Returns `true` to keep the app running, or `false`
+    /// to tell the main loop in `run()` to quit.
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        // ── Reboot confirmation modal (highest priority) ──
+        // ── Quit confirmation modal (highest priority) ──
+        if self.quit_confirm {
+            return self.handle_key_quit_confirm(code);
+        }
+
+        // ── Reboot confirmation modal ──
         if self.reboot_confirm.is_some() {
             return self.handle_key_reboot_confirm(code, modifiers);
         }
@@ -440,12 +463,29 @@ impl App {
             (KeyCode::Char('z'), KeyModifiers::NONE) => {
                 self.detail_zoom = !self.detail_zoom;
             }
-            // Quit
-            (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                return false;
+            // Quit — if a task is running, confirm first since quitting drops the
+            // SSH connection(s) and may interrupt the remote operation.
+            (KeyCode::Char('q'), _)
+            | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            | (KeyCode::Esc, _) => {
+                if self.running_task_count() > 0 {
+                    self.quit_confirm = true;
+                } else {
+                    return false;
+                }
             }
-            (KeyCode::Esc, _) => return false,
             _ => {}
+        }
+        true
+    }
+
+    /// Handles a key press while the quit-confirmation modal is open.
+    /// 'y'/'Y' confirms quitting (returns `false`, same as `handle_key`'s quit
+    /// signal); any other key dismisses the modal and keeps the app running.
+    fn handle_key_quit_confirm(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return false,
+            _ => self.quit_confirm = false,
         }
         true
     }
@@ -554,12 +594,28 @@ impl App {
 
 // ── Terminal guard ────────────────────────────────────────────────────────────
 
+/// Undo the terminal setup done at the start of `run()`: leave the alternate
+/// screen, turn off mouse capture, and restore normal (non-raw) input mode.
+/// Without this, the user's shell would be left in a broken state (no visible
+/// input, alternate screen still active) after the program exits.
+fn restore_terminal() {
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+/// Ensures the terminal is restored even if `run()` exits early via `?`
+/// (e.g. an error) or a panic.
+///
+/// This is the RAII pattern: `TerminalGuard` itself holds no data, but as
+/// soon as it goes out of scope, Rust calls its `Drop` impl below — on every
+/// exit path, including early returns and panics (but *not* on
+/// `std::process::exit`, which is why the deliberate-quit path in `run()`
+/// calls `restore_terminal()` directly before exiting).
 pub struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+        restore_terminal();
     }
 }
 
@@ -600,7 +656,25 @@ pub async fn run(mut app: App, mut rx: UnboundedReceiver<AppMessage>) -> Result<
                         if key.kind == KeyEventKind::Press
                             && !app.handle_key(key.code, key.modifiers) =>
                     {
-                        break;
+                        // `handle_key` returned `false`, meaning the user confirmed they
+                        // want to quit. We restore the terminal ourselves and call
+                        // `std::process::exit(0)` instead of just returning `Ok(())`.
+                        //
+                        // Why not just return? Each running apt task is a background
+                        // thread (spawned via `tokio::task::spawn_blocking` in
+                        // `start_task`/`start_refresh`) doing blocking SSH network I/O.
+                        // If we returned normally, `main`'s `#[tokio::main]` runtime would
+                        // be dropped, and Tokio's `Drop for Runtime` waits for *all* such
+                        // threads to finish before the process can exit — which could take
+                        // as long as the remote apt command does. `process::exit(0)` ends
+                        // the whole process immediately, taking every thread down with it,
+                        // so quitting feels instant.
+                        //
+                        // `process::exit` skips Rust's normal `Drop` cleanup (so
+                        // `TerminalGuard`'s `Drop` impl below won't run), which is why we
+                        // call `restore_terminal()` explicitly first.
+                        restore_terminal();
+                        std::process::exit(0);
                     }
                     Event::Mouse(mouse) => {
                         app.handle_mouse(mouse.kind, mouse.column);
@@ -610,8 +684,6 @@ pub async fn run(mut app: App, mut rx: UnboundedReceiver<AppMessage>) -> Result<
             }
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -901,6 +973,62 @@ mod tests {
         let mut app = bare_app();
         app.selected_row = 999;
         assert_eq!(app.selected_host_indices(), vec![]);
+    }
+
+    // ── Quit confirmation modal ───────────────────────────────────────────────
+
+    #[test]
+    fn q_with_no_running_tasks_quits_immediately() {
+        let mut app = bare_app();
+        assert!(!app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.quit_confirm);
+    }
+
+    #[test]
+    fn esc_with_no_running_tasks_quits_immediately() {
+        let mut app = bare_app();
+        assert!(!app.handle_key(KeyCode::Esc, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn ctrl_c_with_no_running_tasks_quits_immediately() {
+        let mut app = bare_app();
+        assert!(!app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn q_with_running_task_opens_quit_confirm_modal() {
+        let mut app = bare_app();
+        app.hosts[0].task = Some(TaskState::new(TaskKind::Upgrade));
+        assert!(app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit_confirm);
+    }
+
+    #[test]
+    fn quit_confirm_y_confirms_quit() {
+        let mut app = bare_app();
+        app.hosts[0].task = Some(TaskState::new(TaskKind::Upgrade));
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(!app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn quit_confirm_other_key_cancels() {
+        let mut app = bare_app();
+        app.hosts[0].task = Some(TaskState::new(TaskKind::Upgrade));
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.handle_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.quit_confirm);
+    }
+
+    #[test]
+    fn running_task_count_counts_only_running_tasks() {
+        let mut app = bare_app();
+        assert_eq!(app.running_task_count(), 0);
+        app.hosts[0].task = Some(TaskState::new(TaskKind::Upgrade));
+        assert_eq!(app.running_task_count(), 1);
+        app.hosts[0].task.as_mut().unwrap().status = TaskStatus::Done(0);
+        assert_eq!(app.running_task_count(), 0);
     }
 
     // ── Reboot confirmation modal ─────────────────────────────────────────────

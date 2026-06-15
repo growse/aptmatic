@@ -52,6 +52,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         let hostname = app.hosts[state.host_idx].cfg.hostname.clone();
         render_reboot_confirm_modal(f, &hostname, &state.input, state.mismatch);
     }
+
+    if app.quit_confirm {
+        render_quit_confirm_modal(f, app.running_task_count());
+    }
 }
 
 fn render_title_bar(f: &mut Frame, area: Rect) {
@@ -637,6 +641,40 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: width.min(area.width),
         height: height.min(area.height),
     }
+}
+
+fn render_quit_confirm_modal(f: &mut Frame, running: usize) {
+    let area = f.area();
+    let modal_area = centered_rect(56.min(area.width), 8.min(area.height), area);
+    f.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " ⚠  Confirm Quit ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    let task_word = if running == 1 { "task" } else { "tasks" };
+    let lines = vec![
+        Line::raw(""),
+        Line::from(Span::raw(format!(
+            "  {running} background {task_word} still running."
+        ))),
+        Line::from(Span::raw(
+            "  Quitting closes the SSH connection(s), which may",
+        )),
+        Line::from(Span::raw("  interrupt the operation on the remote host.")),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  y: quit anyway   any other key: cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_reboot_confirm_modal(f: &mut Frame, hostname: &str, input: &str, mismatch: bool) {
