@@ -54,7 +54,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
 
     if app.quit_confirm {
-        render_quit_confirm_modal(f, app.running_task_count());
+        render_quit_confirm_modal(f, app.active_operation_count());
     }
 }
 
@@ -658,11 +658,15 @@ fn render_quit_confirm_modal(f: &mut Frame, running: usize) {
     let inner = block.inner(modal_area);
     f.render_widget(block, modal_area);
 
-    let task_word = if running == 1 { "task" } else { "tasks" };
+    let op_word = if running == 1 {
+        "operation"
+    } else {
+        "operations"
+    };
     let lines = vec![
         Line::raw(""),
         Line::from(Span::raw(format!(
-            "  {running} background {task_word} still running."
+            "  {running} background {op_word} still running."
         ))),
         Line::from(Span::raw(
             "  Quitting closes the SSH connection(s), which may",

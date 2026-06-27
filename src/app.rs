@@ -225,6 +225,7 @@ impl App {
     }
 
     /// Number of hosts with a task currently in progress.
+    #[cfg(test)]
     pub fn running_task_count(&self) -> usize {
         self.hosts
             .iter()
@@ -233,6 +234,19 @@ impl App {
                     h.task.as_ref().map(|t| &t.status),
                     Some(TaskStatus::Running)
                 )
+            })
+            .count()
+    }
+
+    /// Number of hosts with any active SSH work: apt tasks or gather/refresh.
+    pub fn active_operation_count(&self) -> usize {
+        self.hosts
+            .iter()
+            .filter(|h| {
+                matches!(
+                    h.task.as_ref().map(|t| &t.status),
+                    Some(TaskStatus::Running)
+                ) || matches!(h.status, HostStatus::Connecting | HostStatus::Gathering)
             })
             .count()
     }
@@ -361,7 +375,7 @@ impl App {
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         // ── Quit confirmation modal (highest priority) ──
         if self.quit_confirm {
-            return self.handle_key_quit_confirm(code);
+            return self.handle_key_quit_confirm(code, modifiers);
         }
 
         // ── Reboot confirmation modal ──
@@ -468,7 +482,7 @@ impl App {
             (KeyCode::Char('q'), _)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL)
             | (KeyCode::Esc, _) => {
-                if self.running_task_count() > 0 {
+                if self.active_operation_count() > 0 {
                     self.quit_confirm = true;
                 } else {
                     return false;
@@ -480,11 +494,11 @@ impl App {
     }
 
     /// Handles a key press while the quit-confirmation modal is open.
-    /// 'y'/'Y' confirms quitting (returns `false`, same as `handle_key`'s quit
-    /// signal); any other key dismisses the modal and keeps the app running.
-    fn handle_key_quit_confirm(&mut self, code: KeyCode) -> bool {
+    /// 'y'/'Y' and Ctrl-C confirm quitting; any other key dismisses the modal.
+    fn handle_key_quit_confirm(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') => return false,
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return false,
             _ => self.quit_confirm = false,
         }
         true
@@ -592,6 +606,26 @@ impl App {
     }
 }
 
+// ── Process exit ─────────────────────────────────────────────────────────────
+
+/// Terminates the process immediately using POSIX `_exit`, bypassing C atexit
+/// handlers. This is necessary because libssh2 links OpenSSL, which registers
+/// an atexit cleanup handler. If any SSH background thread is mid-operation
+/// holding an OpenSSL lock when `exit()` runs, the atexit handler deadlocks —
+/// the process hangs until something else (e.g. an external SIGINT) kills it.
+/// `_exit` skips all that and terminates instantly.
+fn exit_now(code: i32) -> ! {
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        _exit(code);
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
 // ── Terminal guard ────────────────────────────────────────────────────────────
 
 /// Undo the terminal setup done at the start of `run()`: leave the alternate
@@ -640,8 +674,22 @@ pub async fn run(mut app: App, mut rx: UnboundedReceiver<AppMessage>) -> Result<
     let mut events = EventStream::new();
     let mut tick_interval = interval(Duration::from_millis(100));
 
+    // Restore the terminal and exit cleanly if SIGTERM arrives (e.g. `kill <pid>`).
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            let _ = s.recv().await;
+            restore_terminal();
+            exit_now(143);
+        }
+    });
+
     loop {
-        terminal.draw(|f| crate::ui::render(f, &mut app))?;
+        if terminal.draw(|f| crate::ui::render(f, &mut app)).is_err() {
+            restore_terminal();
+            exit_now(1);
+        }
 
         tokio::select! {
             _ = tick_interval.tick() => {
@@ -674,7 +722,7 @@ pub async fn run(mut app: App, mut rx: UnboundedReceiver<AppMessage>) -> Result<
                         // `TerminalGuard`'s `Drop` impl below won't run), which is why we
                         // call `restore_terminal()` explicitly first.
                         restore_terminal();
-                        std::process::exit(0);
+                        exit_now(0);
                     }
                     Event::Mouse(mouse) => {
                         app.handle_mouse(mouse.kind, mouse.column);
@@ -1031,6 +1079,26 @@ mod tests {
         assert_eq!(app.running_task_count(), 0);
     }
 
+    #[test]
+    fn active_operation_count_includes_gather_states() {
+        let mut app = bare_app();
+        assert_eq!(app.active_operation_count(), 0);
+        app.hosts[0].status = HostStatus::Connecting;
+        assert_eq!(app.active_operation_count(), 1);
+        app.hosts[0].status = HostStatus::Gathering;
+        assert_eq!(app.active_operation_count(), 1);
+        app.hosts[0].status = HostStatus::Ready;
+        assert_eq!(app.active_operation_count(), 0);
+    }
+
+    #[test]
+    fn q_with_mid_refresh_host_opens_quit_confirm_modal() {
+        let mut app = bare_app();
+        app.hosts[0].status = HostStatus::Connecting;
+        assert!(app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.quit_confirm);
+    }
+
     // ── Reboot confirmation modal ─────────────────────────────────────────────
 
     fn one_host_app() -> App {
@@ -1069,6 +1137,17 @@ mod tests {
         assert!(app.reboot_confirm.is_some());
         app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.reboot_confirm.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_when_quit_confirm_modal_is_open() {
+        let mut app = bare_app();
+        app.hosts[0].task = Some(TaskState::new(TaskKind::Upgrade));
+        // 'q' shows the modal (task running)
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.quit_confirm);
+        // Ctrl-C quits immediately without requiring 'y'
+        assert!(!app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     }
 
     #[test]
