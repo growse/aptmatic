@@ -47,7 +47,6 @@ pub struct HostConfig {
     pub port: u16,
     pub use_sudo: bool,
     pub identity_file: Option<PathBuf>,
-    #[allow(dead_code)]
     pub group: Option<String>,
 }
 

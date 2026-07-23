@@ -60,6 +60,7 @@ pub enum HostStatus {
 pub enum TaskKind {
     Update,
     Upgrade,
+    UpgradeSecurity(Vec<String>),
     FullUpgrade,
     AutoRemove,
     PurgeRc,
@@ -67,14 +68,17 @@ pub enum TaskKind {
 }
 
 impl TaskKind {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            TaskKind::Update => "apt-get update",
-            TaskKind::Upgrade => "apt-get upgrade",
-            TaskKind::FullUpgrade => "apt-get full-upgrade",
-            TaskKind::AutoRemove => "apt-get autoremove --purge",
-            TaskKind::PurgeRc => "purge RC packages",
-            TaskKind::Reboot => "reboot",
+            TaskKind::Update => "apt-get update".to_string(),
+            TaskKind::Upgrade => "apt-get upgrade".to_string(),
+            TaskKind::UpgradeSecurity(pkgs) => {
+                format!("apt-get upgrade (security, {} pkg(s))", pkgs.len())
+            }
+            TaskKind::FullUpgrade => "apt-get full-upgrade".to_string(),
+            TaskKind::AutoRemove => "apt-get autoremove --purge".to_string(),
+            TaskKind::PurgeRc => "purge RC packages".to_string(),
+            TaskKind::Reboot => "reboot".to_string(),
         }
     }
 
@@ -86,6 +90,12 @@ impl TaskKind {
             }
             TaskKind::Upgrade => {
                 format!("DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y upgrade 2>&1")
+            }
+            TaskKind::UpgradeSecurity(pkgs) => {
+                let names = pkgs.join(" ");
+                format!(
+                    "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get install --only-upgrade -y {names} 2>&1"
+                )
             }
             TaskKind::FullUpgrade => {
                 format!(
@@ -194,6 +204,11 @@ pub struct App {
     pub reboot_confirm: Option<RebootConfirmState>,
     /// When true, the quit confirmation modal is active (shown when tasks are still running).
     pub quit_confirm: bool,
+    /// Current sidebar search/filter text. Empty means no filter is applied.
+    pub filter: String,
+    /// When true, keystrokes are being captured into `filter` instead of
+    /// triggering normal keybindings.
+    pub filter_editing: bool,
 }
 
 impl App {
@@ -221,6 +236,8 @@ impl App {
             dragging_sidebar: false,
             reboot_confirm: None,
             quit_confirm: false,
+            filter: String::new(),
+            filter_editing: false,
         }
     }
 
@@ -258,17 +275,119 @@ impl App {
             Some(SidebarRow::Group { .. }) => {
                 // Collect Host rows immediately following this Group row, stopping
                 // at the next Group row. Matching by position (not name) avoids
-                // incorrectly merging duplicate-named groups.
+                // incorrectly merging duplicate-named groups. Also stop at an
+                // ungrouped host: since `sidebar_rows()` appends top-level hosts
+                // directly after the last group with no separating marker, they
+                // would otherwise be swept into that last group's selection.
                 let mut idxs = Vec::new();
                 for row in self.sidebar_rows.iter().skip(self.selected_row + 1) {
                     match row {
                         SidebarRow::Group { .. } => break,
-                        SidebarRow::Host { host_idx } => idxs.push(*host_idx),
+                        SidebarRow::Host { host_idx }
+                            if self.hosts[*host_idx].cfg.group.is_some() =>
+                        {
+                            idxs.push(*host_idx);
+                        }
+                        SidebarRow::Host { .. } => break,
                     }
                 }
                 idxs
             }
             None => vec![],
+        }
+    }
+
+    /// Indices into `sidebar_rows` that should be visible given the current
+    /// filter text. A group row is included if its name matches, or if any
+    /// of its hosts match (in which case only the matching hosts are
+    /// included alongside it). An empty filter shows every row.
+    pub fn filtered_row_indices(&self) -> Vec<usize> {
+        let q = self.filter.trim().to_lowercase();
+        if q.is_empty() {
+            return (0..self.sidebar_rows.len()).collect();
+        }
+
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < self.sidebar_rows.len() {
+            match &self.sidebar_rows[i] {
+                SidebarRow::Group { name } => {
+                    let group_row_idx = i;
+                    let mut j = i + 1;
+                    // Stop at the next group, or at an ungrouped host — top-level
+                    // hosts are appended right after the last group with no
+                    // separating marker, so they must not be treated as its
+                    // children (see the same fix in `selected_host_indices`).
+                    while j < self.sidebar_rows.len() {
+                        match &self.sidebar_rows[j] {
+                            SidebarRow::Host { host_idx }
+                                if self.hosts[*host_idx].cfg.group.is_some() =>
+                            {
+                                j += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let group_matches = name.to_lowercase().contains(&q);
+                    if group_matches {
+                        result.extend(group_row_idx..j);
+                    } else {
+                        let matched_children: Vec<usize> = (i + 1..j)
+                            .filter(|&k| match &self.sidebar_rows[k] {
+                                SidebarRow::Host { host_idx } => self.hosts[*host_idx]
+                                    .cfg
+                                    .hostname
+                                    .to_lowercase()
+                                    .contains(&q),
+                                _ => false,
+                            })
+                            .collect();
+                        if !matched_children.is_empty() {
+                            result.push(group_row_idx);
+                            result.extend(matched_children);
+                        }
+                    }
+                    i = j;
+                }
+                SidebarRow::Host { host_idx } => {
+                    if self.hosts[*host_idx]
+                        .cfg
+                        .hostname
+                        .to_lowercase()
+                        .contains(&q)
+                    {
+                        result.push(i);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        result
+    }
+
+    /// Move the sidebar selection by `delta` positions among the currently
+    /// visible (filtered) rows.
+    pub fn move_selection(&mut self, delta: i32) {
+        let filtered = self.filtered_row_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let current_pos = filtered
+            .iter()
+            .position(|&r| r == self.selected_row)
+            .unwrap_or(0);
+        let new_pos = (current_pos as i32 + delta).clamp(0, filtered.len() as i32 - 1) as usize;
+        self.selected_row = filtered[new_pos];
+    }
+
+    /// If the current selection is hidden by the active filter, jump to the
+    /// first visible row instead.
+    fn ensure_selection_visible(&mut self) {
+        let filtered = self.filtered_row_indices();
+        if !filtered.contains(&self.selected_row)
+            && let Some(&first) = filtered.first()
+        {
+            self.selected_row = first;
         }
     }
 
@@ -330,6 +449,21 @@ impl App {
         });
     }
 
+    /// Trigger a security-only upgrade on one host, using whatever security
+    /// packages were found in its last gather. Does nothing if there are
+    /// none, or if a task is already running.
+    pub fn start_security_upgrade(&mut self, host_idx: usize) {
+        let pkgs = self.hosts[host_idx]
+            .info
+            .as_ref()
+            .map(|i| i.security_package_names())
+            .unwrap_or_default();
+        if pkgs.is_empty() {
+            return;
+        }
+        self.start_task(host_idx, TaskKind::UpgradeSecurity(pkgs));
+    }
+
     pub fn handle_message(&mut self, msg: AppMessage) {
         match msg {
             AppMessage::GatherDone { host_idx, result } => {
@@ -383,6 +517,11 @@ impl App {
             return self.handle_key_reboot_confirm(code, modifiers);
         }
 
+        // ── Sidebar search/filter editing ──
+        if self.filter_editing {
+            return self.handle_key_filter_edit(code, modifiers);
+        }
+
         // ── Task output overlay ──
         if let Some(host_idx) = self.viewing_task {
             return self.handle_key_task_view(host_idx, code);
@@ -390,15 +529,27 @@ impl App {
 
         match (code, modifiers) {
             // Navigate sidebar
-            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE)
-                if self.selected_row > 0 =>
-            {
-                self.selected_row -= 1;
+            (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                self.move_selection(-1);
             }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE)
-                if self.selected_row + 1 < self.sidebar_rows.len() =>
-            {
-                self.selected_row += 1;
+            (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                self.move_selection(1);
+            }
+            // Enter sidebar search/filter mode
+            (KeyCode::Char('/'), _) => {
+                self.filter_editing = true;
+            }
+            // apt-get install --only-upgrade (security packages only, selected)
+            (KeyCode::Char('s'), KeyModifiers::NONE) => {
+                for idx in self.selected_host_indices() {
+                    self.start_security_upgrade(idx);
+                }
+            }
+            // apt-get install --only-upgrade (security packages only, all)
+            (KeyCode::Char('S'), _) => {
+                for idx in 0..self.hosts.len() {
+                    self.start_security_upgrade(idx);
+                }
             }
             // apt-get update + refresh (selected)
             (KeyCode::Char('r'), KeyModifiers::NONE) => {
@@ -536,6 +687,32 @@ impl App {
                     state.input.push(c);
                     state.mismatch = false;
                 }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Handles a key press while sidebar search/filter editing is active.
+    /// Printable characters are appended to the filter; arrow keys navigate
+    /// the (already filtered) sidebar without leaving edit mode.
+    fn handle_key_filter_edit(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        match code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.filter_editing = false;
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.ensure_selection_visible();
+            }
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.filter.push(c);
+                self.ensure_selection_visible();
             }
             _ => {}
         }
@@ -1013,14 +1190,38 @@ mod tests {
             ..Default::default()
         });
         app.selected_row = 0; // Group "empty"
-        assert_eq!(app.selected_host_indices(), vec![]);
+        assert_eq!(app.selected_host_indices(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn selected_host_indices_group_excludes_trailing_ungrouped_hosts() {
+        // A group followed directly by top-level (ungrouped) hosts, with no
+        // further group in between — sidebar_rows has no marker separating
+        // them, so the ungrouped host must not leak into the group's selection.
+        let app = make_app(RawConfig {
+            defaults: Defaults {
+                user: Some("alice".to_string()),
+                ..Default::default()
+            },
+            groups: vec![RawGroup {
+                name: "web".to_string(),
+                user: None,
+                port: None,
+                use_sudo: None,
+                identity_file: None,
+                hosts: vec![raw_host("web1.example.com")],
+            }],
+            hosts: vec![raw_host("db1.example.com")],
+        });
+        // sidebar_rows = [Group"web", Host{0=web1}, Host{1=db1}]; selecting the group
+        assert_eq!(app.selected_host_indices(), vec![0]);
     }
 
     #[test]
     fn selected_host_indices_out_of_bounds_returns_empty() {
         let mut app = bare_app();
         app.selected_row = 999;
-        assert_eq!(app.selected_host_indices(), vec![]);
+        assert_eq!(app.selected_host_indices(), Vec::<usize>::new());
     }
 
     // ── Quit confirmation modal ───────────────────────────────────────────────
@@ -1217,5 +1418,238 @@ mod tests {
             app.sidebar_width, original_width,
             "mouse drag should be blocked by modal"
         );
+    }
+
+    // ── Security-only upgrade ────────────────────────────────────────────────
+
+    fn security_pkg(name: &str) -> crate::apt::Package {
+        crate::apt::Package {
+            name: name.to_string(),
+            new_version: "2.0".to_string(),
+            current_version: Some("1.0".to_string()),
+            is_security: true,
+        }
+    }
+
+    fn non_security_pkg(name: &str) -> crate::apt::Package {
+        crate::apt::Package {
+            name: name.to_string(),
+            new_version: "2.0".to_string(),
+            current_version: Some("1.0".to_string()),
+            is_security: false,
+        }
+    }
+
+    #[test]
+    fn task_kind_command_upgrade_security_with_sudo() {
+        let cmd = TaskKind::UpgradeSecurity(vec!["curl".to_string(), "openssl".to_string()])
+            .command(true);
+        assert!(cmd.contains("sudo -n"));
+        assert!(cmd.contains("install --only-upgrade"));
+        assert!(cmd.contains("curl openssl"));
+    }
+
+    #[test]
+    fn task_kind_command_upgrade_security_without_sudo() {
+        let cmd = TaskKind::UpgradeSecurity(vec!["curl".to_string()]).command(false);
+        assert!(!cmd.contains("sudo"));
+        assert!(cmd.contains("curl"));
+    }
+
+    #[test]
+    fn task_kind_label_upgrade_security_includes_count() {
+        let label =
+            TaskKind::UpgradeSecurity(vec!["curl".to_string(), "openssl".to_string()]).label();
+        assert!(label.contains("2 pkg"));
+    }
+
+    #[test]
+    fn start_security_upgrade_does_nothing_without_security_packages() {
+        let mut app = one_host_app();
+        app.hosts[0].info = Some(HostInfo {
+            upgradable: vec![non_security_pkg("vim")],
+            ..Default::default()
+        });
+        app.start_security_upgrade(0);
+        assert!(app.hosts[0].task.is_none());
+    }
+
+    #[test]
+    fn start_security_upgrade_does_nothing_without_gathered_info() {
+        let mut app = one_host_app();
+        app.start_security_upgrade(0);
+        assert!(app.hosts[0].task.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_security_upgrade_triggers_task_with_security_packages_only() {
+        let mut app = one_host_app();
+        app.hosts[0].info = Some(HostInfo {
+            upgradable: vec![security_pkg("openssl"), non_security_pkg("vim")],
+            ..Default::default()
+        });
+        app.start_security_upgrade(0);
+        match &app.hosts[0].task.as_ref().unwrap().kind {
+            TaskKind::UpgradeSecurity(pkgs) => assert_eq!(pkgs, &vec!["openssl".to_string()]),
+            other => panic!("expected UpgradeSecurity task, got {other:?}"),
+        }
+    }
+
+    // ── Sidebar search/filter ─────────────────────────────────────────────────
+
+    fn grouped_app() -> App {
+        make_app(RawConfig {
+            defaults: Defaults {
+                user: Some("alice".to_string()),
+                ..Default::default()
+            },
+            groups: vec![RawGroup {
+                name: "webservers".to_string(),
+                user: None,
+                port: None,
+                use_sudo: None,
+                identity_file: None,
+                hosts: vec![raw_host("web1.example.com"), raw_host("web2.example.com")],
+            }],
+            hosts: vec![raw_host("db1.example.com")],
+        })
+    }
+
+    #[test]
+    fn filtered_row_indices_empty_filter_returns_everything() {
+        let app = grouped_app();
+        // sidebar_rows = [Group, Host(web1), Host(web2), Host(db1)]
+        assert_eq!(app.filtered_row_indices(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn filtered_row_indices_matches_host_includes_parent_group() {
+        let mut app = grouped_app();
+        app.filter = "web1".to_string();
+        assert_eq!(app.filtered_row_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn filtered_row_indices_matches_group_name_includes_all_children() {
+        let mut app = grouped_app();
+        app.filter = "webservers".to_string();
+        assert_eq!(app.filtered_row_indices(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filtered_row_indices_matches_ungrouped_host() {
+        let mut app = grouped_app();
+        app.filter = "db1".to_string();
+        assert_eq!(app.filtered_row_indices(), vec![3]);
+    }
+
+    #[test]
+    fn filtered_row_indices_no_match_returns_empty() {
+        let mut app = grouped_app();
+        app.filter = "nonexistent".to_string();
+        assert!(app.filtered_row_indices().is_empty());
+    }
+
+    #[test]
+    fn filtered_row_indices_is_case_insensitive() {
+        let mut app = grouped_app();
+        app.filter = "WEB1".to_string();
+        assert_eq!(app.filtered_row_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn move_selection_skips_hidden_rows() {
+        let mut app = grouped_app();
+        app.filter = "web".to_string(); // matches group name -> [0, 1, 2]
+        app.selected_row = 0;
+        app.move_selection(1);
+        assert_eq!(app.selected_row, 1);
+        app.move_selection(1);
+        assert_eq!(app.selected_row, 2);
+        // Clamped at the end of the filtered set
+        app.move_selection(1);
+        assert_eq!(app.selected_row, 2);
+    }
+
+    #[test]
+    fn move_selection_does_nothing_when_filter_matches_nothing() {
+        let mut app = grouped_app();
+        app.selected_row = 1;
+        app.filter = "nonexistent".to_string();
+        app.move_selection(1);
+        assert_eq!(app.selected_row, 1);
+    }
+
+    #[test]
+    fn slash_key_enters_filter_editing_mode() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(app.filter_editing);
+    }
+
+    #[test]
+    fn typing_while_filtering_appends_to_filter() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(app.filter, "w1");
+    }
+
+    #[test]
+    fn backspace_while_filtering_removes_last_char() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.filter, "");
+    }
+
+    #[test]
+    fn enter_exits_filter_editing_and_keeps_filter() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.filter_editing);
+        assert_eq!(app.filter, "w");
+    }
+
+    #[test]
+    fn esc_exits_filter_editing_and_keeps_filter() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.filter_editing);
+        assert_eq!(app.filter, "w");
+    }
+
+    #[test]
+    fn ctrl_c_quits_while_filter_editing() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(!app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn q_does_not_quit_while_filter_editing_but_is_typed() {
+        let mut app = grouped_app();
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        assert!(app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.filter, "q");
+    }
+
+    #[test]
+    fn typing_selects_first_match_automatically() {
+        let mut app = grouped_app();
+        app.selected_row = 3; // db1, unrelated to the filter we're about to type
+        app.handle_key(KeyCode::Char('/'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        // "web" matches the group -> rows [0, 1, 2]; selection (3) was hidden,
+        // so it should have jumped to the first visible row.
+        assert_eq!(app.selected_row, 0);
     }
 }

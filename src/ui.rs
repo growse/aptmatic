@@ -80,10 +80,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
     let line1 = format!(
-        "{refresh_status}r:update+refresh  R:update+refresh all  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all"
+        "{refresh_status}r:update+refresh  R:update+refresh all  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all  s:sec-upgrade  S:sec-upgrade all"
     );
-    let line2 =
-        " a:autoremove  A:autoremove all  p:purge-rc  b:reboot  t:task output  z:zoom  q:quit";
+    let line2 = " a:autoremove  A:autoremove all  p:purge-rc  b:reboot  t:task output  z:zoom  /:search  q:quit";
     let text = vec![
         Line::from(Span::raw(format!(" {line1}"))),
         Line::from(Span::raw(line2)),
@@ -93,14 +92,28 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::RIGHT).title("Hosts");
+    let title = if app.filter_editing {
+        format!("Hosts  /{}", app.filter)
+    } else if !app.filter.is_empty() {
+        format!("Hosts  (filter: {})", app.filter)
+    } else {
+        "Hosts".to_string()
+    };
+    let block = Block::default().borders(Borders::RIGHT).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let items: Vec<ListItem> = app
-        .sidebar_rows
+    let filtered = app.filtered_row_indices();
+
+    if filtered.is_empty() {
+        let p = Paragraph::new(" no matches").style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = filtered
         .iter()
-        .map(|row| match row {
+        .map(|&row_idx| match &app.sidebar_rows[row_idx] {
             SidebarRow::Group { name } => ListItem::new(Line::from(vec![Span::styled(
                 format!(" ▸ {name}"),
                 Style::default()
@@ -134,6 +147,15 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Span::raw("")
                 };
+                let security_count = h.info.as_ref().map(|i| i.security_count()).unwrap_or(0);
+                let security_badge = if security_count > 0 {
+                    Span::styled(
+                        format!(" [{security_count} sec]"),
+                        Style::default().fg(Color::Red),
+                    )
+                } else {
+                    Span::raw("")
+                };
                 let reboot_required = h.info.as_ref().map(|i| i.reboot_required).unwrap_or(false);
                 let reboot_needed_badge = if reboot_required {
                     Span::raw(" [R]")
@@ -147,6 +169,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(h.cfg.hostname.clone(), name_style),
                     kernel_badge,
                     update_count_badge,
+                    security_badge,
                     reboot_needed_badge,
                 ]))
             }
@@ -154,7 +177,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(app.selected_row));
+    state.select(filtered.iter().position(|&r| r == app.selected_row));
 
     let list = List::new(items).highlight_style(
         Style::default()
@@ -353,8 +376,14 @@ fn render_upgradable_panel(f: &mut Frame, h: &crate::app::HostState, area: Rect)
         }
     };
 
+    let security_count = info.security_count();
     let title = if info.upgradable.is_empty() {
         " Upgradable: none ".to_string()
+    } else if security_count > 0 {
+        format!(
+            " Upgradable ({}, {security_count} security) ",
+            info.upgradable.len()
+        )
     } else {
         format!(" Upgradable ({}) ", info.upgradable.len())
     };
@@ -370,9 +399,15 @@ fn render_upgradable_panel(f: &mut Frame, h: &crate::app::HostState, area: Rect)
             .as_deref()
             .map(|v| format!(" ({v} →)"))
             .unwrap_or_default();
+        let security_badge = if pkg.is_security {
+            Span::styled(" [security]", Style::default().fg(Color::Red))
+        } else {
+            Span::raw("")
+        };
         lines.push(Line::from(vec![
             Span::raw(format!(" {}{from} ", pkg.name)),
             Span::styled(&pkg.new_version, Style::default().fg(Color::Cyan)),
+            security_badge,
         ]));
     }
 
@@ -615,7 +650,10 @@ fn host_status_str(h: &crate::app::HostState) -> String {
         HostStatus::Gathering => "gathering…".to_string(),
         HostStatus::Ready => {
             let upgrades = h.info.as_ref().map(|i| i.upgradable.len()).unwrap_or(0);
-            if upgrades > 0 {
+            let security = h.info.as_ref().map(|i| i.security_count()).unwrap_or(0);
+            if upgrades > 0 && security > 0 {
+                format!("{upgrades} upgrade(s) available ({security} security)")
+            } else if upgrades > 0 {
                 format!("{upgrades} upgrade(s) available")
             } else {
                 "up to date".to_string()

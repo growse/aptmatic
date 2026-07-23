@@ -4,6 +4,9 @@ pub struct Package {
     pub name: String,
     pub new_version: String,
     pub current_version: Option<String>,
+    /// True if the package's origin suite looks like a security repo
+    /// (e.g. `bookworm-security`, `jammy-security`).
+    pub is_security: bool,
 }
 
 /// Represents a package held back from upgrades, along with the reason.
@@ -41,6 +44,22 @@ pub struct HostInfo {
     pub autoremovable: Vec<String>,
 }
 
+impl HostInfo {
+    /// Number of upgradable packages originating from a security suite.
+    pub fn security_count(&self) -> usize {
+        self.upgradable.iter().filter(|p| p.is_security).count()
+    }
+
+    /// Names of upgradable packages originating from a security suite.
+    pub fn security_package_names(&self) -> Vec<String> {
+        self.upgradable
+            .iter()
+            .filter(|p| p.is_security)
+            .map(|p| p.name.clone())
+            .collect()
+    }
+}
+
 /// Parse output of `LC_ALL=C apt list --upgradable 2>/dev/null`
 pub fn parse_upgradable(output: &str) -> Vec<Package> {
     let mut pkgs = Vec::new();
@@ -60,9 +79,8 @@ fn parse_upgradable_line(line: &str) -> Option<Package> {
     let slash = line.find('/')?;
     let name = line[..slash].trim().to_string();
     let after = &line[slash + 1..];
-    // Skip suite
     let mut parts = after.splitn(3, ' ');
-    parts.next()?; // suite
+    let suite = parts.next()?;
     let new_version = parts.next()?.trim().to_string();
     let current_version = parts.next().and_then(|rest| {
         let tag = "upgradable from: ";
@@ -73,10 +91,15 @@ fn parse_upgradable_line(line: &str) -> Option<Package> {
     if name.is_empty() || new_version.is_empty() {
         return None;
     }
+    // Debian/Ubuntu security suites are named e.g. `bookworm-security`,
+    // `jammy-security`; multi-origin packages report a comma-separated list
+    // such as `jammy-updates,jammy-security`.
+    let is_security = suite.to_lowercase().contains("security");
     Some(Package {
         name,
         new_version,
         current_version,
+        is_security,
     })
 }
 
@@ -233,6 +256,51 @@ mod tests {
         assert_eq!(pkgs[0].name, "curl");
         assert_eq!(pkgs[0].new_version, "7.88.1-10+deb12u8");
         assert_eq!(pkgs[0].current_version.as_deref(), Some("7.88.1-10"));
+        assert!(!pkgs[0].is_security);
+    }
+
+    #[test]
+    fn parse_upgradable_debian_security_suite() {
+        let input =
+            "openssl/bookworm-security 3.0.15-1~deb12u1 amd64 [upgradable from: 3.0.11-1~deb12u2]";
+        let pkgs = parse_upgradable(input);
+        assert!(pkgs[0].is_security);
+    }
+
+    #[test]
+    fn parse_upgradable_ubuntu_security_suite() {
+        let input =
+            "curl/jammy-security 7.81.0-1ubuntu1.16 amd64 [upgradable from: 7.81.0-1ubuntu1.15]";
+        let pkgs = parse_upgradable(input);
+        assert!(pkgs[0].is_security);
+    }
+
+    #[test]
+    fn parse_upgradable_multi_origin_security_suite() {
+        let input = "curl/jammy-updates,jammy-security 7.81.0-1ubuntu1.16 amd64 [upgradable from: 7.81.0-1ubuntu1.15]";
+        let pkgs = parse_upgradable(input);
+        assert!(pkgs[0].is_security);
+    }
+
+    #[test]
+    fn parse_upgradable_non_security_suite_is_not_flagged() {
+        let input = "vim/jammy-updates 2:8.2.3995-1ubuntu2.15 amd64 [upgradable from: 2:8.2.3995-1ubuntu2.14]";
+        let pkgs = parse_upgradable(input);
+        assert!(!pkgs[0].is_security);
+    }
+
+    #[test]
+    fn security_count_counts_only_security_packages() {
+        let input = "\
+curl/jammy-security 7.81.0-1ubuntu1.16 amd64 [upgradable from: 7.81.0-1ubuntu1.15]
+vim/jammy-updates 2:8.2.3995-1ubuntu2.15 amd64 [upgradable from: 2:8.2.3995-1ubuntu2.14]
+";
+        let info = HostInfo {
+            upgradable: parse_upgradable(input),
+            ..Default::default()
+        };
+        assert_eq!(info.security_count(), 1);
+        assert_eq!(info.security_package_names(), vec!["curl"]);
     }
 
     #[test]

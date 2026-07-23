@@ -33,6 +33,8 @@ A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts �
 - 🌀 **Live task output** — watch `apt-get upgrade` scroll by in real time
 - 🐧 **Kernel tracking** — know which hosts are silently waiting for a reboot
 - 📦 **Held/kept-back packages** — spot the stragglers and why they're stuck
+- 🛡️ **Security-update badge** — upgradable packages from a security suite are called out separately, with a key to upgrade just those
+- 🔍 **Sidebar search** — `/` to filter hosts/groups by name in a big fleet
 - 🧹 **RC package purging** — one key to purge all those half-removed ghosts
 - 🖱️ **Draggable divider** — because you deserve to customise your own TUI
 - 🦀 **Written in Rust** — guaranteed\* to have no bugs
@@ -85,16 +87,21 @@ hostname = "db1.example.com"
 |-----|--------|
 | `↑` / `k` | Move up |
 | `↓` / `j` | Move down |
+| `/` | Search/filter the sidebar by hostname or group name |
 | `r` | Refresh selected host(s) |
 | `R` | Refresh **all** hosts |
 | `u` | `apt-get update` on selected |
 | `U` | `apt-get upgrade` on selected |
+| `s` | Upgrade **security-only** packages on selected |
+| `S` | Upgrade **security-only** packages on **all** hosts |
 | `p` | Purge RC packages on selected |
 | `t` / `Enter` | View live task output |
 | `z` | Zoom — hide sidebar for clean copy/paste |
 | `q` / `Esc` | Quit |
 
 The sidebar divider is also mouse-draggable if you're feeling fancy.
+
+While searching, type to filter, `↑`/`↓` to jump between matches, `Enter`/`Esc` to stop editing (the filter stays applied — clear it by backspacing to empty).
 
 ## Development
 
