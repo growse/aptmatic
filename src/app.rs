@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -13,13 +14,20 @@ use crossterm::{
 };
 use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::interval;
 
 use crate::apt::HostInfo;
+use crate::cache::{self, Cache};
 use crate::config::{Config, HostConfig, SidebarRow};
 
 pub const TASK_OUTPUT_CAP: usize = 5_000;
+
+/// Maximum number of simultaneous SSH operations (gathers and apt tasks
+/// combined). Triggering an action on a large group or "all" hosts still
+/// queues the rest instead of opening a connection per host at once.
+pub const MAX_CONCURRENT_SSH_OPS: usize = 8;
 
 // ── Messages flowing from background tasks to the app ────────────────────────
 
@@ -158,6 +166,9 @@ pub struct HostState {
     pub status: HostStatus,
     pub info: Option<HostInfo>,
     pub task: Option<TaskState>,
+    /// True when `info` was loaded from the on-disk cache and hasn't been
+    /// confirmed by a live gather yet this run.
+    pub is_stale: bool,
 }
 
 impl HostState {
@@ -167,6 +178,7 @@ impl HostState {
             status: HostStatus::Unknown,
             info: None,
             task: None,
+            is_stale: false,
         }
     }
 }
@@ -209,13 +221,25 @@ pub struct App {
     /// When true, keystrokes are being captured into `filter` instead of
     /// triggering normal keybindings.
     pub filter_editing: bool,
+    /// On-disk gather cache, kept in memory and rewritten after each
+    /// successful gather.
+    pub cache: Cache,
+    /// Bounds the number of SSH connections/operations in flight at once.
+    pub ssh_semaphore: Arc<Semaphore>,
 }
 
 impl App {
     pub fn new(config: &Config, tx: UnboundedSender<AppMessage>) -> Self {
         let host_cfgs = config.resolved_hosts();
         let sidebar_rows = config.sidebar_rows(&host_cfgs);
-        let hosts: Vec<HostState> = host_cfgs.into_iter().map(HostState::new).collect();
+        let cache = cache::load();
+        let mut hosts: Vec<HostState> = host_cfgs.into_iter().map(HostState::new).collect();
+        for h in &mut hosts {
+            if let Some(entry) = cache.get(&cache::host_key(&h.cfg)) {
+                h.info = Some(entry.info.clone());
+                h.is_stale = true;
+            }
+        }
         Self {
             hosts,
             sidebar_rows,
@@ -238,6 +262,8 @@ impl App {
             quit_confirm: false,
             filter: String::new(),
             filter_editing: false,
+            cache,
+            ssh_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SSH_OPS)),
         }
     }
 
@@ -391,17 +417,31 @@ impl App {
         }
     }
 
-    /// Trigger a gather refresh for one host.
+    /// Trigger a gather refresh for one host. Queues behind `ssh_semaphore`
+    /// so that refreshing a large group or "all" hosts doesn't open a
+    /// connection per host simultaneously.
     pub fn start_refresh(&self, host_idx: usize) {
         let cfg = self.hosts[host_idx].cfg.clone();
         let tx = self.tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = crate::gather::gather(&cfg).map_err(|e| format!("{e:#}"));
+        let semaphore = self.ssh_semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("ssh_semaphore is never closed");
+            let result = tokio::task::spawn_blocking(move || {
+                crate::gather::gather(&cfg).map_err(|e| format!("{e:#}"))
+            })
+            .await
+            .unwrap_or_else(|_| Err("gather task panicked".to_string()));
             let _ = tx.send(AppMessage::GatherDone { host_idx, result });
         });
     }
 
-    /// Trigger an apt task on one host. Does nothing if a task is already running.
+    /// Trigger an apt task on one host. Does nothing if a task is already
+    /// running. Queues behind `ssh_semaphore` so that triggering an action on
+    /// a large group or "all" hosts doesn't open a connection per host
+    /// simultaneously.
     pub fn start_task(&mut self, host_idx: usize, kind: TaskKind) {
         if matches!(
             self.hosts[host_idx].task.as_ref().map(|t| &t.status),
@@ -413,39 +453,47 @@ impl App {
         let tx = self.tx.clone();
         let cmd = kind.command(cfg.use_sudo);
         self.hosts[host_idx].task = Some(TaskState::new(kind));
-        tokio::task::spawn_blocking(move || {
-            let sess = match crate::ssh::SshSession::connect(&cfg) {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(AppMessage::TaskLine {
-                        host_idx,
-                        line: format!("Connection failed: {e:#}"),
-                    });
-                    let _ = tx.send(AppMessage::TaskFailed {
-                        host_idx,
-                        error: format!("{e:#}"),
-                    });
-                    return;
-                }
-            };
-            let tx_cb = tx.clone();
-            let exit = sess.exec_streaming(&cmd, move |line| {
-                let _ = tx_cb.send(AppMessage::TaskLine { host_idx, line });
-            });
-            let exit_code = match exit {
-                Ok(code) => code,
-                Err(e) => {
-                    let _ = tx.send(AppMessage::TaskLine {
-                        host_idx,
-                        line: format!("Error: {e:#}"),
-                    });
-                    -1
-                }
-            };
-            let _ = tx.send(AppMessage::TaskDone {
-                host_idx,
-                exit_code,
-            });
+        let semaphore = self.ssh_semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("ssh_semaphore is never closed");
+            let _ = tokio::task::spawn_blocking(move || {
+                let sess = match crate::ssh::SshSession::connect(&cfg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(AppMessage::TaskLine {
+                            host_idx,
+                            line: format!("Connection failed: {e:#}"),
+                        });
+                        let _ = tx.send(AppMessage::TaskFailed {
+                            host_idx,
+                            error: format!("{e:#}"),
+                        });
+                        return;
+                    }
+                };
+                let tx_cb = tx.clone();
+                let exit = sess.exec_streaming(&cmd, move |line| {
+                    let _ = tx_cb.send(AppMessage::TaskLine { host_idx, line });
+                });
+                let exit_code = match exit {
+                    Ok(code) => code,
+                    Err(e) => {
+                        let _ = tx.send(AppMessage::TaskLine {
+                            host_idx,
+                            line: format!("Error: {e:#}"),
+                        });
+                        -1
+                    }
+                };
+                let _ = tx.send(AppMessage::TaskDone {
+                    host_idx,
+                    exit_code,
+                });
+            })
+            .await;
         });
     }
 
@@ -466,18 +514,27 @@ impl App {
 
     pub fn handle_message(&mut self, msg: AppMessage) {
         match msg {
-            AppMessage::GatherDone { host_idx, result } => {
-                let h = &mut self.hosts[host_idx];
-                match result {
-                    Ok(info) => {
-                        h.info = Some(info);
-                        h.status = HostStatus::Ready;
-                    }
-                    Err(e) => {
-                        h.status = HostStatus::Error(e);
-                    }
+            AppMessage::GatherDone { host_idx, result } => match result {
+                Ok(info) => {
+                    let key = cache::host_key(&self.hosts[host_idx].cfg);
+                    self.cache.insert(
+                        key,
+                        cache::CacheEntry {
+                            info: info.clone(),
+                            fetched_at_unix: cache::now_unix(),
+                        },
+                    );
+                    let _ = cache::save(&self.cache);
+
+                    let h = &mut self.hosts[host_idx];
+                    h.info = Some(info);
+                    h.status = HostStatus::Ready;
+                    h.is_stale = false;
                 }
-            }
+                Err(e) => {
+                    self.hosts[host_idx].status = HostStatus::Error(e);
+                }
+            },
             AppMessage::TaskLine { host_idx, line } => {
                 if let Some(task) = self.hosts[host_idx].task.as_mut() {
                     task.push_line(line);

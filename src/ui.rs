@@ -646,7 +646,9 @@ fn section_header(title: &str) -> Line<'static> {
 fn host_status_str(h: &crate::app::HostState) -> String {
     match &h.status {
         HostStatus::Unknown => "unknown".to_string(),
+        HostStatus::Connecting if h.is_stale => "connecting… (showing cached data)".to_string(),
         HostStatus::Connecting => "connecting…".to_string(),
+        HostStatus::Gathering if h.is_stale => "gathering… (showing cached data)".to_string(),
         HostStatus::Gathering => "gathering…".to_string(),
         HostStatus::Ready => {
             let upgrades = h.info.as_ref().map(|i| i.upgradable.len()).unwrap_or(0);

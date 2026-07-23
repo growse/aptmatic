@@ -93,6 +93,7 @@ dependencies = [
  "futures",
  "ratatui",
  "serde",
+ "serde_json",
  "ssh2",
  "tokio",
  "toml",

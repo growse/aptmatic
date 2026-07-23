@@ -1,5 +1,6 @@
 mod app;
 mod apt;
+mod cache;
 mod config;
 mod gather;
 mod ssh;

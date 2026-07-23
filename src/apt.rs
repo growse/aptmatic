@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
+
 /// A single upgradable apt package.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
     pub name: String,
     pub new_version: String,
@@ -10,7 +12,7 @@ pub struct Package {
 }
 
 /// Represents a package held back from upgrades, along with the reason.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeldPackage {
     pub name: String,
     pub reason: HoldReason,
@@ -18,7 +20,7 @@ pub struct HeldPackage {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HoldReason {
     /// Held via `apt-mark hold`
     ManualHold,
@@ -27,13 +29,13 @@ pub enum HoldReason {
 }
 
 /// A package with dpkg rc status (removed but config files remain).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RcPackage {
     pub name: String,
 }
 
 /// All gathered information for a single host.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostInfo {
     pub running_kernel: String,
     pub latest_kernel: Option<String>,

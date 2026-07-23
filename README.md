@@ -35,6 +35,8 @@ A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts �
 - 📦 **Held/kept-back packages** — spot the stragglers and why they're stuck
 - 🛡️ **Security-update badge** — upgradable packages from a security suite are called out separately, with a key to upgrade just those
 - 🔍 **Sidebar search** — `/` to filter hosts/groups by name in a big fleet
+- 💾 **Cached last-known state** — the dashboard isn't blank on startup while it reconnects
+- 🚦 **Bounded connection concurrency** — "all hosts" actions queue instead of opening a connection per host at once
 - 🧹 **RC package purging** — one key to purge all those half-removed ghosts
 - 🖱️ **Draggable divider** — because you deserve to customise your own TUI
 - 🦀 **Written in Rust** — guaranteed\* to have no bugs
@@ -102,6 +104,8 @@ hostname = "db1.example.com"
 The sidebar divider is also mouse-draggable if you're feeling fancy.
 
 While searching, type to filter, `↑`/`↓` to jump between matches, `Enter`/`Esc` to stop editing (the filter stays applied — clear it by backspacing to empty).
+
+Actions on a whole group or "all hosts" are queued through a small connection pool (8 at a time) rather than opening an SSH connection per host simultaneously.
 
 ## Development
 
