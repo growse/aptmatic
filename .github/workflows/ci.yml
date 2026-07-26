@@ -10,6 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lockfile:
+    name: Lockfile up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo update --workspace --locked
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
