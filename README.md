@@ -7,22 +7,25 @@
 A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts — written in Rust, because I don't know how to code in OCaml.
 
 ```
-╭─ aptmatic ─────────────────────────────────────────────────────────────╮
-│ Hosts          │  Detail                                               │
-│ ▸ webservers   │  web1.example.com                                     │
-│    ● web1  [2] │  user: ubuntu  port: 22  sudo: true                   │
-│    ● web2      │                                                       │
-│ ▸ databases    │  Status: 2 upgrade(s) available                       │
-│    ⠸ db1       │                                                       │
-│    ● db2       │  Kernel                                               │
-│                │  Running: 6.1.0-28-amd64                              │
-│                │  Latest:  linux-image-6.1.0-32-amd64 ← reboot to activate │
-│                │                                                       │
-│                │  Upgradable                                           │
-│                │  curl (7.88.1-10 →) 7.88.1-10+deb12u8                │
-│                │  libcurl4 (7.88.1-10 →) 7.88.1-10+deb12u8            │
-╰────────────────────────────────────────────────────────────────────────╯
- r:refresh  R:refresh all  u:update  U:upgrade  p:purge-rc  t:task output  z:zoom  q:quit
+╭─ aptmatic ──────────────────────────────────────────────────────╮
+│ Hosts          │Detail                                          │
+│ ▸ webservers   │web1.example.com                                │
+│    ● web1  [2] │user: ubuntu  port: 22  sudo: true              │
+│    ● web2      │                                                │
+│ ▸ databases    │Status: 2 upgrade(s) available (1 security)     │
+│    ⠼ db1       │                                                │
+│    ● db2       │Kernel                                          │
+│                │Running: 6.1.0-28-amd64                         │
+│                │Latest:  linux-image-6.1.0-32-amd64 ← reboot    │
+│                │                                                │
+│                │Upgradable                                      │
+│                │[sec] curl (7.88.1-10 → 7.88.1-10+deb12u8)      │
+│                │      libcurl4 (7.88.1-10 → 7.88.1-10+deb12u8)  │
+╰─────────────────────────────────────────────────────────────────╯
+ r:update+refresh  R:refresh all  u:upgrade  U:upgrade all
+ f:full-upgrade  F:full-upgrade all  s:sec-upgrade  S:sec-upgrade all
+ a:autoremove  A:autoremove all  p:purge-rc  b:reboot  t:task output
+ z:zoom  /:search  q:quit
 ```
 
 ## Features
