@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::{App, DiffState, HostStatus, TaskStatus};
+use crate::app::{App, ConffileAction, DiffState, HostStatus, TaskStatus};
 use crate::apt::HoldReason;
 use crate::config::SidebarRow;
 
@@ -825,14 +825,27 @@ fn render_conffile_review_modal(f: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, file)| {
-            let marker = if i == state.selected { " > " } else { "   " };
+            let cursor = if i == state.selected { " > " } else { "   " };
+            let mark = match state.decisions.get(i).copied().flatten() {
+                Some(ConffileAction::Discard) => {
+                    Span::styled("[discard] ", Style::default().fg(Color::Yellow))
+                }
+                Some(ConffileAction::Apply) => Span::styled(
+                    "[apply  ] ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                None => Span::styled("[       ] ", Style::default().fg(Color::DarkGray)),
+            };
             let owner = file
                 .package
                 .as_deref()
                 .map(|p| format!("  [{p}]"))
                 .unwrap_or_default();
             ListItem::new(Line::from(vec![
-                Span::raw(marker.to_string()),
+                Span::raw(cursor.to_string()),
+                mark,
                 Span::styled(file.pending_path.clone(), Style::default().fg(Color::White)),
                 Span::styled(owner, Style::default().fg(Color::DarkGray)),
             ]))
@@ -890,14 +903,16 @@ fn render_conffile_review_modal(f: &mut Frame, app: &App) {
         }
     }
 
-    let footer = if state.confirm_apply {
-        let live = state
-            .selected_file()
-            .map(|f| f.live_path.as_str())
-            .unwrap_or("");
+    let (discards, applies) = state.marked_counts();
+    let footer = if state.confirm_execute {
+        let apply_warning = if applies > 0 {
+            format!(", replacing {applies} live config(s) (old kept as .dpkg-old)")
+        } else {
+            String::new()
+        };
         Line::from(Span::styled(
             format!(
-                " Replace {live} with the new version (old kept as .dpkg-old)?  y: confirm   any other key: cancel"
+                " Execute {discards} discard(s), {applies} apply(ies){apply_warning}?  y: confirm   any other key: cancel"
             ),
             Style::default().bg(Color::Red).fg(Color::White),
         ))
@@ -907,8 +922,16 @@ fn render_conffile_review_modal(f: &mut Frame, app: &App) {
             Style::default().bg(Color::DarkGray).fg(Color::Yellow),
         ))
     } else {
+        let marked = discards + applies;
+        let enter_hint = if marked > 0 {
+            format!("Enter:execute {marked} marked  ")
+        } else {
+            String::new()
+        };
         Line::from(Span::styled(
-            " ↑/↓:file  PgUp/PgDn:scroll  d:discard new (keep current)  a:apply new  Esc:close",
+            format!(
+                " ↑/↓:file  PgUp/PgDn:scroll  d:mark discard  a:mark apply  u:unmark  {enter_hint}Esc:close"
+            ),
             Style::default().bg(Color::DarkGray).fg(Color::White),
         ))
     };
@@ -978,7 +1001,7 @@ fn render_reboot_confirm_modal(f: &mut Frame, hostname: &str, input: &str, misma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, ConffileReviewState, DiffState};
+    use crate::app::{App, ConffileAction, ConffileReviewState, DiffState};
     use crate::apt::{HostInfo, PendingConffile};
     use crate::config::{Config, Defaults, RawConfig, RawHost};
     use ratatui::{Terminal, backend::TestBackend};
@@ -1013,13 +1036,18 @@ mod tests {
         });
         let mut diffs = std::collections::HashMap::new();
         diffs.insert(files[0].pending_path.clone(), diff);
+        // A mix of marked and undecided files, so every marker style renders.
+        let mut decisions = vec![None; files.len()];
+        decisions[0] = Some(ConffileAction::Discard);
+        decisions[1] = Some(ConffileAction::Apply);
         app.conffile_review = Some(ConffileReviewState {
             host_idx: 0,
+            decisions,
             files,
             selected: 0,
             diffs,
             scroll: 0,
-            confirm_apply: false,
+            confirm_execute: false,
             notice: None,
         });
         app
@@ -1058,11 +1086,11 @@ mod tests {
     #[test]
     fn review_modal_renders_confirm_and_notice_footers() {
         let mut app = app_with_review(DiffState::Loaded(vec!["-old".into(), "+new".into()]));
-        app.conffile_review.as_mut().unwrap().confirm_apply = true;
+        app.conffile_review.as_mut().unwrap().confirm_execute = true;
         draw_at(&mut app, 80, 24);
 
         let state = app.conffile_review.as_mut().unwrap();
-        state.confirm_apply = false;
+        state.confirm_execute = false;
         state.notice = Some("a task is already running on this host".to_string());
         draw_at(&mut app, 80, 24);
     }

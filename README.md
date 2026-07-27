@@ -117,17 +117,19 @@ The sidebar divider is also mouse-draggable if you're feeling fancy.
 
 ### Pending config files
 
-Upgrades run with `--force-confdef --force-confold`, so dpkg never stops to ask what to do about a config file you've edited — it keeps yours and drops the maintainer's version next to it as `.dpkg-dist`. Hosts carrying unresolved files show a `[n cfg]` badge in the sidebar; `c` opens a review pane listing them with a diff against the live file:
+Upgrades run with `--force-confdef --force-confold`, so dpkg never stops to ask what to do about a config file you've edited — it keeps yours and drops the maintainer's version next to it as `.dpkg-dist`. Hosts carrying unresolved files show a `[n cfg]` badge in the sidebar; `c` opens a review pane listing them with a diff against the live file. Mark each file with a decision, then execute the whole batch in one go:
 
 | Key | Action |
 | --- | --- |
 | `↑` / `↓` | Select a file |
 | `PgUp` / `PgDn` | Scroll the diff |
-| `d` | Discard the new version, keeping your current config |
-| `a` | Install the new version, backing your current one up to `.dpkg-old` (asks first) |
-| `Esc` | Close |
+| `d` | Mark: discard the new version, keeping your current config |
+| `a` | Mark: install the new version, backing your current one up to `.dpkg-old` |
+| `u` / `Space` | Unmark |
+| `Enter` | Execute all marked decisions (asks for confirmation first) |
+| `Esc` | Close without touching anything |
 
-Applying a config file does not restart anything — restart the affected service yourself once you're happy with it.
+Marking is free — nothing happens on the host until you confirm with `Enter` then `y`. Unmarked files are left pending for a later review, and a failure on one file doesn't stop the rest of the batch. Applying a config file does not restart anything — restart the affected service yourself once you're happy with it.
 
 While searching, type to filter, `↑`/`↓` to jump between matches, `Enter`/`Esc` to stop editing (the filter stays applied — clear it by backspacing to empty).
 

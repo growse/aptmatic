@@ -89,12 +89,25 @@ pub enum TaskKind {
     FullUpgrade,
     AutoRemove,
     PurgeRc,
-    /// Delete a pending conffile, leaving the live config untouched.
-    KeepConffile(PendingConffile),
-    /// Move a pending conffile into place, backing the live config up to
-    /// `.dpkg-old` — the same convention dpkg's own prompt follows.
-    ApplyConffile(PendingConffile),
+    /// Execute a batch of reviewed conffile decisions in one SSH task.
+    ResolveConffiles(Vec<ConffileDecision>),
     Reboot,
+}
+
+/// What the user decided to do with one pending conffile in the review modal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConffileAction {
+    /// Delete the pending file, leaving the live config untouched.
+    Discard,
+    /// Move the pending file into place, backing the live config up to
+    /// `.dpkg-old` — the same convention dpkg's own prompt follows.
+    Apply,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConffileDecision {
+    pub file: PendingConffile,
+    pub action: ConffileAction,
 }
 
 impl TaskKind {
@@ -108,8 +121,16 @@ impl TaskKind {
             TaskKind::FullUpgrade => "apt-get full-upgrade".to_string(),
             TaskKind::AutoRemove => "apt-get autoremove --purge".to_string(),
             TaskKind::PurgeRc => "purge RC packages".to_string(),
-            TaskKind::KeepConffile(f) => format!("keep current config {}", f.live_path),
-            TaskKind::ApplyConffile(f) => format!("apply new config {}", f.live_path),
+            TaskKind::ResolveConffiles(decisions) => {
+                let applies = decisions
+                    .iter()
+                    .filter(|d| d.action == ConffileAction::Apply)
+                    .count();
+                format!(
+                    "resolve config files ({} discard, {applies} apply)",
+                    decisions.len() - applies
+                )
+            }
             TaskKind::Reboot => "reboot".to_string(),
         }
     }
@@ -140,24 +161,38 @@ impl TaskKind {
             TaskKind::PurgeRc => format!(
                 r#"pkgs=$(LC_ALL=C dpkg -l | awk '/^rc/{{print $2}}'); [ -n "$pkgs" ] && echo "$pkgs" | xargs {sudo}dpkg --purge 2>&1 || echo "No RC packages to purge""#
             ),
-            // Paths are quoted everywhere they appear, including inside the
-            // progress `echo`s — a filename is allowed to contain `$` and
-            // backticks, and these strings are built from remote `find` output.
-            TaskKind::KeepConffile(f) => {
-                let pending = shell_quote(&f.pending_path);
-                format!("{sudo}rm -f -- {pending} 2>&1 && echo discarded {pending}")
-            }
-            TaskKind::ApplyConffile(f) => {
-                let pending = shell_quote(&f.pending_path);
-                let live = shell_quote(&f.live_path);
-                let backup = shell_quote(&format!("{}.dpkg-old", f.live_path));
-                // Back up first and bail if that fails, so a failed copy can
-                // never leave the host without its original config.
-                format!(
-                    "set -e; if [ -e {live} ]; then {sudo}cp -a -- {live} {backup}; \
-                     echo 'backed up' {live} '->' {backup}; fi; \
-                     {sudo}mv -- {pending} {live}; echo installed {live}"
-                )
+            // Each decision runs in isolation: a failure is reported and sets
+            // the exit code, but never stops the remaining files from being
+            // resolved. Paths are quoted everywhere they appear, including
+            // inside the progress `echo`s — a filename is allowed to contain
+            // `$` and backticks, and these strings are built from remote
+            // `find` output.
+            TaskKind::ResolveConffiles(decisions) => {
+                let mut parts: Vec<String> = vec!["fail=0".to_string()];
+                for d in decisions {
+                    let pending = shell_quote(&d.file.pending_path);
+                    match d.action {
+                        ConffileAction::Discard => parts.push(format!(
+                            "{sudo}rm -f -- {pending} && echo discarded {pending} \
+                             || {{ echo FAILED: {pending}; fail=1; }}"
+                        )),
+                        ConffileAction::Apply => {
+                            let live = shell_quote(&d.file.live_path);
+                            let backup = shell_quote(&format!("{}.dpkg-old", d.file.live_path));
+                            // Back up first, inside `set -e`, so a failed copy
+                            // can never leave the host without its original
+                            // config — the move simply doesn't happen.
+                            parts.push(format!(
+                                "( set -e; if [ -e {live} ]; then {sudo}cp -a -- {live} {backup}; \
+                                 echo 'backed up' {live} '->' {backup}; fi; \
+                                 {sudo}mv -- {pending} {live} ) \
+                                 && echo installed {live} || {{ echo FAILED: {live}; fail=1; }}"
+                            ));
+                        }
+                    }
+                }
+                parts.push("exit $fail".to_string());
+                format!("{{ {}; }} 2>&1", parts.join("; "))
             }
             TaskKind::Reboot => format!("{sudo}reboot 2>&1"),
         }
@@ -239,12 +274,16 @@ pub struct ConffileReviewState {
     pub host_idx: usize,
     /// Snapshot taken when the modal opened; the live gather may move on.
     pub files: Vec<PendingConffile>,
+    /// Marks parallel to `files`; `None` means undecided. Nothing touches the
+    /// host until the batch is executed with Enter.
+    pub decisions: Vec<Option<ConffileAction>>,
     pub selected: usize,
     /// Diffs keyed by pending path, fetched lazily as files are selected.
     pub diffs: std::collections::HashMap<String, DiffState>,
     pub scroll: u16,
-    /// True once the user has pressed `a`; the next key confirms or cancels.
-    pub confirm_apply: bool,
+    /// True once the user has pressed Enter with marks set; the next key
+    /// confirms or cancels executing the batch.
+    pub confirm_execute: bool,
     /// Transient footer message, e.g. why an action was refused.
     pub notice: Option<String>,
 }
@@ -256,6 +295,47 @@ impl ConffileReviewState {
 
     pub fn selected_diff(&self) -> Option<&DiffState> {
         self.diffs.get(&self.selected_file()?.pending_path)
+    }
+
+    /// Marked files paired with their action, in list order.
+    pub fn marked_decisions(&self) -> Vec<ConffileDecision> {
+        self.files
+            .iter()
+            .zip(&self.decisions)
+            .filter_map(|(file, d)| {
+                d.map(|action| ConffileDecision {
+                    file: file.clone(),
+                    action,
+                })
+            })
+            .collect()
+    }
+
+    /// (discards, applies) currently marked.
+    pub fn marked_counts(&self) -> (usize, usize) {
+        let discards = self
+            .decisions
+            .iter()
+            .filter(|d| **d == Some(ConffileAction::Discard))
+            .count();
+        let applies = self
+            .decisions
+            .iter()
+            .filter(|d| **d == Some(ConffileAction::Apply))
+            .count();
+        (discards, applies)
+    }
+
+    /// Toggle a mark on the selected file: same action again clears it, a
+    /// different action replaces it.
+    fn toggle_mark(&mut self, action: ConffileAction) {
+        if let Some(slot) = self.decisions.get_mut(self.selected) {
+            *slot = if *slot == Some(action) {
+                None
+            } else {
+                Some(action)
+            };
+        }
     }
 }
 
@@ -604,11 +684,12 @@ impl App {
         }
         self.conffile_review = Some(ConffileReviewState {
             host_idx,
+            decisions: vec![None; files.len()],
             files,
             selected: 0,
             diffs: std::collections::HashMap::new(),
             scroll: 0,
-            confirm_apply: false,
+            confirm_execute: false,
             notice: None,
         });
         self.request_selected_diff();
@@ -665,35 +746,31 @@ impl App {
         });
     }
 
-    /// Resolve the currently selected conffile. The mutation runs through the
-    /// normal task machinery so its output lands in the task pane and the
-    /// follow-up gather refreshes the pending count; the modal closes because
-    /// only one task per host can run at a time.
-    fn resolve_selected_conffile(&mut self, apply: bool) {
+    /// Execute every marked decision as one task. The mutations run through
+    /// the normal task machinery so their output lands in the task pane and
+    /// the follow-up gather refreshes the pending count; the modal closes
+    /// because only one task per host can run at a time.
+    fn execute_conffile_decisions(&mut self) {
         let Some(state) = self.conffile_review.as_ref() else {
             return;
         };
         let host_idx = state.host_idx;
-        let Some(file) = state.selected_file().cloned() else {
+        let decisions = state.marked_decisions();
+        if decisions.is_empty() {
             return;
-        };
+        }
         if matches!(
             self.hosts[host_idx].task.as_ref().map(|t| &t.status),
             Some(TaskStatus::Running)
         ) {
             if let Some(state) = self.conffile_review.as_mut() {
-                state.confirm_apply = false;
+                state.confirm_execute = false;
                 state.notice = Some("a task is already running on this host".to_string());
             }
             return;
         }
-        let kind = if apply {
-            TaskKind::ApplyConffile(file)
-        } else {
-            TaskKind::KeepConffile(file)
-        };
         self.conffile_review = None;
-        self.start_task(host_idx, kind);
+        self.start_task(host_idx, TaskKind::ResolveConffiles(decisions));
     }
 
     pub fn handle_message(&mut self, msg: AppMessage) {
@@ -963,19 +1040,21 @@ impl App {
     }
 
     /// Handles a key press while the pending-conffile review modal is open.
+    /// `d`/`a` only mark files; nothing touches the host until Enter, and
+    /// executing the batch takes a second keypress to confirm.
     fn handle_key_conffile_review(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
-        // Applying replaces a live config file, so it takes a second keypress.
-        // While that is pending, no other binding is reachable.
+        // While the execute confirmation is pending, no other binding is
+        // reachable.
         if self
             .conffile_review
             .as_ref()
-            .is_some_and(|s| s.confirm_apply)
+            .is_some_and(|s| s.confirm_execute)
         {
             match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.resolve_selected_conffile(true),
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.execute_conffile_decisions(),
                 _ => {
                     if let Some(state) = self.conffile_review.as_mut() {
-                        state.confirm_apply = false;
+                        state.confirm_execute = false;
                     }
                 }
             }
@@ -1012,12 +1091,34 @@ impl App {
                 (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => state.scroll = 0,
                 (KeyCode::Char('d'), KeyModifiers::NONE) => {
                     state.notice = None;
-                    self.resolve_selected_conffile(false);
-                    return true;
+                    state.toggle_mark(ConffileAction::Discard);
+                    // Advance to the next file, batch-triage style.
+                    if state.selected + 1 < state.files.len() {
+                        state.selected += 1;
+                        selection_moved = true;
+                    }
                 }
                 (KeyCode::Char('a'), KeyModifiers::NONE) => {
                     state.notice = None;
-                    state.confirm_apply = true;
+                    state.toggle_mark(ConffileAction::Apply);
+                    if state.selected + 1 < state.files.len() {
+                        state.selected += 1;
+                        selection_moved = true;
+                    }
+                }
+                (KeyCode::Char('u'), KeyModifiers::NONE) | (KeyCode::Char(' '), _) => {
+                    if let Some(slot) = state.decisions.get_mut(state.selected) {
+                        *slot = None;
+                    }
+                }
+                (KeyCode::Enter, _) => {
+                    if state.marked_decisions().is_empty() {
+                        state.notice =
+                            Some("nothing marked — d marks discard, a marks apply".to_string());
+                    } else {
+                        state.notice = None;
+                        state.confirm_execute = true;
+                    }
                 }
                 _ => {}
             }
@@ -1385,40 +1486,81 @@ mod tests {
         }
     }
 
+    fn discard(live: &str) -> ConffileDecision {
+        ConffileDecision {
+            file: pending_conffile(live),
+            action: ConffileAction::Discard,
+        }
+    }
+
+    fn apply(live: &str) -> ConffileDecision {
+        ConffileDecision {
+            file: pending_conffile(live),
+            action: ConffileAction::Apply,
+        }
+    }
+
     #[test]
-    fn keep_conffile_removes_only_the_pending_file() {
-        let cmd = TaskKind::KeepConffile(pending_conffile("/etc/ssh/sshd_config")).command(true);
+    fn resolve_discard_removes_only_the_pending_file() {
+        let cmd = TaskKind::ResolveConffiles(vec![discard("/etc/ssh/sshd_config")]).command(true);
         assert!(cmd.contains("sudo -n rm -f -- '/etc/ssh/sshd_config.dpkg-dist'"));
         // The live config must not appear as an argument to rm.
         assert!(!cmd.contains("rm -f -- '/etc/ssh/sshd_config'"));
     }
 
     #[test]
-    fn apply_conffile_backs_up_before_replacing() {
-        let cmd = TaskKind::ApplyConffile(pending_conffile("/etc/ssh/sshd_config")).command(true);
+    fn resolve_apply_backs_up_before_replacing() {
+        let cmd = TaskKind::ResolveConffiles(vec![apply("/etc/ssh/sshd_config")]).command(true);
         let backup = cmd
             .find("cp -a --")
             .expect("apply must copy the live file first");
         let install = cmd.find("mv --").expect("apply must move the new file in");
         assert!(backup < install, "backup has to happen before the move");
         assert!(cmd.contains("'/etc/ssh/sshd_config.dpkg-old'"));
-        // `set -e` is what makes a failed backup abort the move.
-        assert!(cmd.starts_with("set -e;"));
+        // `set -e` inside the subshell is what makes a failed backup abort
+        // the move for that file.
+        assert!(cmd.contains("( set -e;"));
+    }
+
+    /// One failed file must not stop the rest of the batch, but must still
+    /// fail the task overall.
+    #[test]
+    fn resolve_batch_isolates_failures_and_reports_them() {
+        let cmd = TaskKind::ResolveConffiles(vec![
+            apply("/etc/a.conf"),
+            discard("/etc/b.conf"),
+            apply("/etc/c.conf"),
+        ])
+        .command(true);
+        // Every decision appears, in order.
+        let a = cmd.find("'/etc/a.conf'").expect("a missing");
+        let b = cmd.find("'/etc/b.conf.dpkg-dist'").expect("b missing");
+        let c = cmd.find("'/etc/c.conf'").expect("c missing");
+        assert!(a < b && b < c, "decisions out of order");
+        // Failure handling: each step records rather than aborts, and the
+        // batch exits non-zero if anything failed.
+        assert_eq!(cmd.matches("fail=1").count(), 3);
+        assert!(cmd.contains("exit $fail"));
+        // A bare `set -e` outside the per-file subshells would abort the
+        // whole batch on the first failure.
+        assert!(!cmd.contains("{ set -e"));
     }
 
     /// Paths come from `find` on the remote host, so a filename containing a
     /// quote must not be able to break out into a second command.
     #[test]
-    fn conffile_commands_quote_hostile_paths() {
+    fn resolve_commands_quote_hostile_paths() {
         let nasty = PendingConffile {
             pending_path: "/etc/x'; rm -rf /; '.dpkg-dist".to_string(),
             live_path: "/etc/x'; rm -rf /; '".to_string(),
             package: None,
         };
-        for cmd in [
-            TaskKind::KeepConffile(nasty.clone()).command(false),
-            TaskKind::ApplyConffile(nasty.clone()).command(false),
-        ] {
+        for action in [ConffileAction::Discard, ConffileAction::Apply] {
+            let cmd = TaskKind::ResolveConffiles(vec![ConffileDecision {
+                file: nasty.clone(),
+                action,
+            }])
+            .command(false);
             assert!(
                 !cmd.contains("; rm -rf /; '.dpkg-dist'"),
                 "path escaped quoting: {cmd}"
@@ -1431,6 +1573,16 @@ mod tests {
                 "unquoted path reached the command: {cmd}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_label_counts_each_action() {
+        let kind = TaskKind::ResolveConffiles(vec![
+            discard("/etc/a.conf"),
+            apply("/etc/b.conf"),
+            discard("/etc/c.conf"),
+        ]);
+        assert_eq!(kind.label(), "resolve config files (2 discard, 1 apply)");
     }
 
     fn app_with_pending_conffiles(files: Vec<PendingConffile>) -> App {
@@ -1493,40 +1645,118 @@ mod tests {
         assert_eq!(app.conffile_review.as_ref().unwrap().selected, 0);
     }
 
-    /// Applying overwrites a live config, so a single stray keypress must not
-    /// be enough to do it.
+    /// `d`/`a` only mark; nothing may touch the host until the batch is
+    /// confirmed with Enter + y.
     #[tokio::test]
-    async fn apply_requires_confirmation() {
-        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+    async fn marking_never_starts_a_task() {
+        let mut app = app_with_pending_conffiles(vec![
+            pending_conffile("/etc/a.conf"),
+            pending_conffile("/etc/b.conf"),
+        ]);
         app.open_conffile_review(0);
 
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
-        assert!(app.conffile_review.as_ref().unwrap().confirm_apply);
-        assert!(app.hosts[0].task.is_none(), "no task before confirming");
 
-        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
-        assert!(!app.conffile_review.as_ref().unwrap().confirm_apply);
-        assert!(app.hosts[0].task.is_none(), "cancelling must not act");
+        let state = app.conffile_review.as_ref().unwrap();
+        assert_eq!(state.decisions[0], Some(ConffileAction::Discard));
+        assert_eq!(state.decisions[1], Some(ConffileAction::Apply));
+        assert!(app.hosts[0].task.is_none(), "marking must not act");
+    }
 
-        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
-        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
-        assert!(app.conffile_review.is_none(), "modal closes once acted on");
-        assert!(matches!(
-            app.hosts[0].task.as_ref().map(|t| &t.kind),
-            Some(TaskKind::ApplyConffile(_))
-        ));
+    /// Marking auto-advances so a batch can be triaged with repeated
+    /// keypresses.
+    #[tokio::test]
+    async fn marking_advances_to_the_next_file() {
+        let mut app = app_with_pending_conffiles(vec![
+            pending_conffile("/etc/a.conf"),
+            pending_conffile("/etc/b.conf"),
+        ]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(app.conffile_review.as_ref().unwrap().selected, 1);
     }
 
     #[tokio::test]
-    async fn discard_acts_immediately() {
-        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+    async fn marking_same_action_again_unmarks() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/a.conf")]);
         app.open_conffile_review(0);
         app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
-        assert!(app.conffile_review.is_none());
-        assert!(matches!(
-            app.hosts[0].task.as_ref().map(|t| &t.kind),
-            Some(TaskKind::KeepConffile(_))
-        ));
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(app.conffile_review.as_ref().unwrap().decisions[0], None);
+    }
+
+    #[tokio::test]
+    async fn unmark_clears_a_decision() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/a.conf")]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('u'), KeyModifiers::NONE);
+        assert_eq!(app.conffile_review.as_ref().unwrap().decisions[0], None);
+    }
+
+    /// Executing mutates live configs, so a single stray Enter must not be
+    /// enough to do it.
+    #[tokio::test]
+    async fn execute_requires_confirmation() {
+        let mut app = app_with_pending_conffiles(vec![
+            pending_conffile("/etc/a.conf"),
+            pending_conffile("/etc/b.conf"),
+        ]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.conffile_review.as_ref().unwrap().confirm_execute);
+        assert!(app.hosts[0].task.is_none(), "no task before confirming");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.conffile_review.as_ref().unwrap().confirm_execute);
+        assert!(app.hosts[0].task.is_none(), "cancelling must not act");
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.conffile_review.is_none(), "modal closes once executed");
+        match app.hosts[0].task.as_ref().map(|t| &t.kind) {
+            Some(TaskKind::ResolveConffiles(decisions)) => {
+                assert_eq!(decisions.len(), 2);
+                assert_eq!(decisions[0].action, ConffileAction::Discard);
+                assert_eq!(decisions[1].action, ConffileAction::Apply);
+            }
+            other => panic!("expected ResolveConffiles task, got {other:?}"),
+        }
+    }
+
+    /// Undecided files are simply left out of the batch — they stay pending
+    /// for a later review.
+    #[tokio::test]
+    async fn execute_skips_unmarked_files() {
+        let mut app = app_with_pending_conffiles(vec![
+            pending_conffile("/etc/a.conf"),
+            pending_conffile("/etc/b.conf"),
+        ]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        match app.hosts[0].task.as_ref().map(|t| &t.kind) {
+            Some(TaskKind::ResolveConffiles(decisions)) => {
+                assert_eq!(decisions.len(), 1);
+                assert_eq!(decisions[0].file.live_path, "/etc/a.conf");
+            }
+            other => panic!("expected ResolveConffiles task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_with_nothing_marked_shows_a_notice() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/a.conf")]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        let state = app.conffile_review.as_ref().unwrap();
+        assert!(!state.confirm_execute);
+        assert!(state.notice.is_some());
     }
 
     #[tokio::test]
@@ -1538,20 +1768,28 @@ mod tests {
         assert!(app.hosts[0].task.is_none());
     }
 
-    /// Only one task per host can run, so an action taken while one is in
-    /// flight would be silently dropped — the modal says so instead.
+    /// Only one task per host can run, so a batch executed while one is in
+    /// flight would be silently dropped — the modal says so instead, keeping
+    /// the marks so nothing has to be re-triaged.
     #[tokio::test]
-    async fn review_refuses_to_act_while_a_task_runs() {
+    async fn review_refuses_to_execute_while_a_task_runs() {
         let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
         app.open_conffile_review(0);
         app.hosts[0].task = Some(TaskState::new(TaskKind::Update));
 
         app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
         let state = app
             .conffile_review
             .as_ref()
             .expect("modal stays open on refusal");
         assert!(state.notice.is_some());
+        assert_eq!(
+            state.decisions[0],
+            Some(ConffileAction::Discard),
+            "marks survive the refusal"
+        );
         assert!(matches!(
             app.hosts[0].task.as_ref().map(|t| &t.kind),
             Some(TaskKind::Update)
