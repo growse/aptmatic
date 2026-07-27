@@ -1,11 +1,12 @@
 use anyhow::Result;
 
 use crate::apt::{
-    HostInfo, parse_autoremovable, parse_held_manually, parse_install_dry_run, parse_kept_back,
-    parse_rc_packages, parse_upgradable,
+    HostInfo, attach_conffile_owners, parse_autoremovable, parse_held_manually,
+    parse_install_dry_run, parse_kept_back, parse_pending_conffiles, parse_rc_packages,
+    parse_upgradable,
 };
 use crate::config::HostConfig;
-use crate::ssh::SshSession;
+use crate::ssh::{SshSession, shell_quote};
 
 const LC: &str = "LC_ALL=C";
 
@@ -93,6 +94,28 @@ pub fn gather(cfg: &HostConfig) -> Result<HostInfo> {
         .unwrap_or_default();
     let autoremovable = parse_autoremovable(&autoremove_out);
 
+    // Config files a package upgrade wanted to install but left beside the
+    // live file. `-xdev` keeps the scan on /etc's own filesystem so a network
+    // mount under /etc can't stall the gather.
+    let conffiles_out = sess
+        .exec(&format!(
+            r"{sudo}find /etc -xdev -type f \( -name '*.dpkg-dist' -o -name '*.dpkg-new' -o -name '*.ucf-dist' \) -print 2>/dev/null"
+        ))
+        .unwrap_or_default();
+    let mut pending_conffiles = parse_pending_conffiles(&conffiles_out);
+    if !pending_conffiles.is_empty() {
+        // One dpkg -S for the whole set; it accepts many paths at once.
+        let paths = pending_conffiles
+            .iter()
+            .map(|f| shell_quote(&f.live_path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let owners = sess
+            .exec(&format!("{LC} dpkg -S {paths} 2>/dev/null"))
+            .unwrap_or_default();
+        attach_conffile_owners(&mut pending_conffiles, &owners);
+    }
+
     Ok(HostInfo {
         running_kernel,
         latest_kernel,
@@ -101,5 +124,6 @@ pub fn gather(cfg: &HostConfig) -> Result<HostInfo> {
         rc_packages,
         held_packages,
         autoremovable,
+        pending_conffiles,
     })
 }

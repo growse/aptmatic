@@ -18,9 +18,10 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::interval;
 
-use crate::apt::HostInfo;
+use crate::apt::{HostInfo, PendingConffile};
 use crate::cache::{self, Cache};
 use crate::config::{Config, HostConfig, SidebarRow};
+use crate::ssh::shell_quote;
 
 pub const TASK_OUTPUT_CAP: usize = 5_000;
 
@@ -28,6 +29,17 @@ pub const TASK_OUTPUT_CAP: usize = 5_000;
 /// combined). Triggering an action on a large group or "all" hosts still
 /// queues the rest instead of opening a connection per host at once.
 pub const MAX_CONCURRENT_SSH_OPS: usize = 8;
+
+/// Environment every apt invocation runs under: no debconf questions, stable
+/// English output for the parsers in `apt.rs`.
+const APT_ENV: &str = "DEBIAN_FRONTEND=noninteractive LC_ALL=C";
+
+/// `DEBIAN_FRONTEND` covers debconf only — dpkg's own conffile prompt is
+/// separate and reads from stdin, which would hang the task forever over SSH.
+/// Take the package's default action where it offers one, otherwise keep the
+/// installed file; both leave the running config untouched.
+const DPKG_CONF_OPTS: &str =
+    r#"-o "Dpkg::Options::=--force-confdef" -o "Dpkg::Options::=--force-confold""#;
 
 // ── Messages flowing from background tasks to the app ────────────────────────
 
@@ -48,6 +60,11 @@ pub enum AppMessage {
     TaskFailed {
         host_idx: usize,
         error: String,
+    },
+    ConffileDiff {
+        host_idx: usize,
+        pending_path: String,
+        result: Result<Vec<String>, String>,
     },
 }
 
@@ -72,6 +89,11 @@ pub enum TaskKind {
     FullUpgrade,
     AutoRemove,
     PurgeRc,
+    /// Delete a pending conffile, leaving the live config untouched.
+    KeepConffile(PendingConffile),
+    /// Move a pending conffile into place, backing the live config up to
+    /// `.dpkg-old` — the same convention dpkg's own prompt follows.
+    ApplyConffile(PendingConffile),
     Reboot,
 }
 
@@ -86,6 +108,8 @@ impl TaskKind {
             TaskKind::FullUpgrade => "apt-get full-upgrade".to_string(),
             TaskKind::AutoRemove => "apt-get autoremove --purge".to_string(),
             TaskKind::PurgeRc => "purge RC packages".to_string(),
+            TaskKind::KeepConffile(f) => format!("keep current config {}", f.live_path),
+            TaskKind::ApplyConffile(f) => format!("apply new config {}", f.live_path),
             TaskKind::Reboot => "reboot".to_string(),
         }
     }
@@ -94,30 +118,47 @@ impl TaskKind {
         let sudo = if use_sudo { "sudo -n " } else { "" };
         match self {
             TaskKind::Update => {
-                format!("DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get update 2>&1")
+                format!("{APT_ENV} {sudo}apt-get update </dev/null 2>&1")
             }
             TaskKind::Upgrade => {
-                format!("DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y upgrade 2>&1")
+                format!("{APT_ENV} {sudo}apt-get -y {DPKG_CONF_OPTS} upgrade </dev/null 2>&1")
             }
             TaskKind::UpgradeSecurity(pkgs) => {
                 let names = pkgs.join(" ");
                 format!(
-                    "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get install --only-upgrade -y {names} 2>&1"
+                    "{APT_ENV} {sudo}apt-get install --only-upgrade -y {DPKG_CONF_OPTS} {names} </dev/null 2>&1"
                 )
             }
             TaskKind::FullUpgrade => {
-                format!(
-                    "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y full-upgrade 2>&1"
-                )
+                format!("{APT_ENV} {sudo}apt-get -y {DPKG_CONF_OPTS} full-upgrade </dev/null 2>&1")
             }
             TaskKind::AutoRemove => {
                 format!(
-                    "DEBIAN_FRONTEND=noninteractive LC_ALL=C {sudo}apt-get -y autoremove --purge 2>&1"
+                    "{APT_ENV} {sudo}apt-get -y {DPKG_CONF_OPTS} autoremove --purge </dev/null 2>&1"
                 )
             }
             TaskKind::PurgeRc => format!(
                 r#"pkgs=$(LC_ALL=C dpkg -l | awk '/^rc/{{print $2}}'); [ -n "$pkgs" ] && echo "$pkgs" | xargs {sudo}dpkg --purge 2>&1 || echo "No RC packages to purge""#
             ),
+            // Paths are quoted everywhere they appear, including inside the
+            // progress `echo`s — a filename is allowed to contain `$` and
+            // backticks, and these strings are built from remote `find` output.
+            TaskKind::KeepConffile(f) => {
+                let pending = shell_quote(&f.pending_path);
+                format!("{sudo}rm -f -- {pending} 2>&1 && echo discarded {pending}")
+            }
+            TaskKind::ApplyConffile(f) => {
+                let pending = shell_quote(&f.pending_path);
+                let live = shell_quote(&f.live_path);
+                let backup = shell_quote(&format!("{}.dpkg-old", f.live_path));
+                // Back up first and bail if that fails, so a failed copy can
+                // never leave the host without its original config.
+                format!(
+                    "set -e; if [ -e {live} ]; then {sudo}cp -a -- {live} {backup}; \
+                     echo 'backed up' {live} '->' {backup}; fi; \
+                     {sudo}mv -- {pending} {live}; echo installed {live}"
+                )
+            }
             TaskKind::Reboot => format!("{sudo}reboot 2>&1"),
         }
     }
@@ -183,6 +224,41 @@ impl HostState {
     }
 }
 
+// ── Pending conffile review modal state ───────────────────────────────────────
+
+/// Diff of one pending conffile against the live file it would replace.
+#[derive(Debug, Clone)]
+pub enum DiffState {
+    Loading,
+    Loaded(Vec<String>),
+    Failed(String),
+}
+
+#[derive(Debug)]
+pub struct ConffileReviewState {
+    pub host_idx: usize,
+    /// Snapshot taken when the modal opened; the live gather may move on.
+    pub files: Vec<PendingConffile>,
+    pub selected: usize,
+    /// Diffs keyed by pending path, fetched lazily as files are selected.
+    pub diffs: std::collections::HashMap<String, DiffState>,
+    pub scroll: u16,
+    /// True once the user has pressed `a`; the next key confirms or cancels.
+    pub confirm_apply: bool,
+    /// Transient footer message, e.g. why an action was refused.
+    pub notice: Option<String>,
+}
+
+impl ConffileReviewState {
+    pub fn selected_file(&self) -> Option<&PendingConffile> {
+        self.files.get(self.selected)
+    }
+
+    pub fn selected_diff(&self) -> Option<&DiffState> {
+        self.diffs.get(&self.selected_file()?.pending_path)
+    }
+}
+
 // ── Reboot confirmation modal state ──────────────────────────────────────────
 
 #[derive(Debug)]
@@ -214,6 +290,8 @@ pub struct App {
     pub dragging_sidebar: bool,
     /// When Some, the reboot confirmation modal is active.
     pub reboot_confirm: Option<RebootConfirmState>,
+    /// When Some, the pending-conffile review modal is active.
+    pub conffile_review: Option<ConffileReviewState>,
     /// When true, the quit confirmation modal is active (shown when tasks are still running).
     pub quit_confirm: bool,
     /// Current sidebar search/filter text. Empty means no filter is applied.
@@ -259,6 +337,7 @@ impl App {
             },
             dragging_sidebar: false,
             reboot_confirm: None,
+            conffile_review: None,
             quit_confirm: false,
             filter: String::new(),
             filter_editing: false,
@@ -512,6 +591,111 @@ impl App {
         self.start_task(host_idx, TaskKind::UpgradeSecurity(pkgs));
     }
 
+    /// Open the pending-conffile review modal for one host. Does nothing when
+    /// the host has no pending files (or hasn't been gathered yet).
+    pub fn open_conffile_review(&mut self, host_idx: usize) {
+        let files = self.hosts[host_idx]
+            .info
+            .as_ref()
+            .map(|i| i.pending_conffiles.clone())
+            .unwrap_or_default();
+        if files.is_empty() {
+            return;
+        }
+        self.conffile_review = Some(ConffileReviewState {
+            host_idx,
+            files,
+            selected: 0,
+            diffs: std::collections::HashMap::new(),
+            scroll: 0,
+            confirm_apply: false,
+            notice: None,
+        });
+        self.request_selected_diff();
+    }
+
+    /// Fetch the diff for the modal's current selection, unless it is already
+    /// loading or loaded.
+    fn request_selected_diff(&mut self) {
+        let Some(state) = self.conffile_review.as_mut() else {
+            return;
+        };
+        let Some(file) = state.files.get(state.selected).cloned() else {
+            return;
+        };
+        if state.diffs.contains_key(&file.pending_path) {
+            return;
+        }
+        state
+            .diffs
+            .insert(file.pending_path.clone(), DiffState::Loading);
+
+        let host_idx = state.host_idx;
+        let cfg = self.hosts[host_idx].cfg.clone();
+        let tx = self.tx.clone();
+        let semaphore = self.ssh_semaphore.clone();
+        let sudo = if cfg.use_sudo { "sudo -n " } else { "" };
+        let live = shell_quote(&file.live_path);
+        let pending = shell_quote(&file.pending_path);
+        // diff exits 1 when files differ, which is the normal case here, so the
+        // exit status is not a useful error signal — `|| true` keeps the shell
+        // from reporting it. The line cap stops a pathological file from
+        // filling memory.
+        let cmd = format!(
+            "LC_ALL=C {sudo}diff -u --label {live} --label {pending} -- {live} {pending} 2>&1 | head -n 2000 || true"
+        );
+        let pending_path = file.pending_path.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("ssh_semaphore is never closed");
+            let result = tokio::task::spawn_blocking(move || {
+                let sess = crate::ssh::SshSession::connect(&cfg).map_err(|e| format!("{e:#}"))?;
+                let out = sess.exec(&cmd).map_err(|e| format!("{e:#}"))?;
+                Ok(out.lines().map(str::to_string).collect::<Vec<String>>())
+            })
+            .await
+            .unwrap_or_else(|_| Err("diff task panicked".to_string()));
+            let _ = tx.send(AppMessage::ConffileDiff {
+                host_idx,
+                pending_path,
+                result,
+            });
+        });
+    }
+
+    /// Resolve the currently selected conffile. The mutation runs through the
+    /// normal task machinery so its output lands in the task pane and the
+    /// follow-up gather refreshes the pending count; the modal closes because
+    /// only one task per host can run at a time.
+    fn resolve_selected_conffile(&mut self, apply: bool) {
+        let Some(state) = self.conffile_review.as_ref() else {
+            return;
+        };
+        let host_idx = state.host_idx;
+        let Some(file) = state.selected_file().cloned() else {
+            return;
+        };
+        if matches!(
+            self.hosts[host_idx].task.as_ref().map(|t| &t.status),
+            Some(TaskStatus::Running)
+        ) {
+            if let Some(state) = self.conffile_review.as_mut() {
+                state.confirm_apply = false;
+                state.notice = Some("a task is already running on this host".to_string());
+            }
+            return;
+        }
+        let kind = if apply {
+            TaskKind::ApplyConffile(file)
+        } else {
+            TaskKind::KeepConffile(file)
+        };
+        self.conffile_review = None;
+        self.start_task(host_idx, kind);
+    }
+
     pub fn handle_message(&mut self, msg: AppMessage) {
         match msg {
             AppMessage::GatherDone { host_idx, result } => match result {
@@ -558,6 +742,22 @@ impl App {
                     task.auto_scroll = true;
                 }
             }
+            AppMessage::ConffileDiff {
+                host_idx,
+                pending_path,
+                result,
+            } => {
+                // Drop diffs that arrive after the modal closed or moved host.
+                if let Some(state) = self.conffile_review.as_mut()
+                    && state.host_idx == host_idx
+                {
+                    let entry = match result {
+                        Ok(lines) => DiffState::Loaded(lines),
+                        Err(e) => DiffState::Failed(e),
+                    };
+                    state.diffs.insert(pending_path, entry);
+                }
+            }
         }
     }
 
@@ -572,6 +772,11 @@ impl App {
         // ── Reboot confirmation modal ──
         if self.reboot_confirm.is_some() {
             return self.handle_key_reboot_confirm(code, modifiers);
+        }
+
+        // ── Pending conffile review modal ──
+        if self.conffile_review.is_some() {
+            return self.handle_key_conffile_review(code, modifiers);
         }
 
         // ── Sidebar search/filter editing ──
@@ -671,6 +876,13 @@ impl App {
                     self.start_task(idx, TaskKind::PurgeRc);
                 }
             }
+            // Review pending config files — single-host selection only, since
+            // each file is resolved individually against its own diff.
+            (KeyCode::Char('c'), KeyModifiers::NONE) => {
+                if let [idx] = self.selected_host_indices()[..] {
+                    self.open_conffile_review(idx);
+                }
+            }
             // View task output
             (KeyCode::Char('t'), _) | (KeyCode::Enter, _) => {
                 // Find a host with an active or completed task in the selection
@@ -746,6 +958,76 @@ impl App {
                 }
             }
             _ => {}
+        }
+        true
+    }
+
+    /// Handles a key press while the pending-conffile review modal is open.
+    fn handle_key_conffile_review(&mut self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        // Applying replaces a live config file, so it takes a second keypress.
+        // While that is pending, no other binding is reachable.
+        if self
+            .conffile_review
+            .as_ref()
+            .is_some_and(|s| s.confirm_apply)
+        {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.resolve_selected_conffile(true),
+                _ => {
+                    if let Some(state) = self.conffile_review.as_mut() {
+                        state.confirm_apply = false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        let mut selection_moved = false;
+        if let Some(state) = self.conffile_review.as_mut() {
+            let diff_len = match state.selected_diff() {
+                Some(DiffState::Loaded(lines)) => lines.len() as u16,
+                _ => 0,
+            };
+            match (code, modifiers) {
+                (KeyCode::Esc, _)
+                | (KeyCode::Char('q'), _)
+                | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    self.conffile_review = None;
+                    return true;
+                }
+                (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    state.selected = state.selected.saturating_sub(1);
+                    selection_moved = true;
+                }
+                (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    if state.selected + 1 < state.files.len() {
+                        state.selected += 1;
+                        selection_moved = true;
+                    }
+                }
+                (KeyCode::PageUp, _) => state.scroll = state.scroll.saturating_sub(10),
+                (KeyCode::PageDown, _) => {
+                    state.scroll = (state.scroll + 10).min(diff_len.saturating_sub(1));
+                }
+                (KeyCode::Home, _) | (KeyCode::Char('g'), KeyModifiers::NONE) => state.scroll = 0,
+                (KeyCode::Char('d'), KeyModifiers::NONE) => {
+                    state.notice = None;
+                    self.resolve_selected_conffile(false);
+                    return true;
+                }
+                (KeyCode::Char('a'), KeyModifiers::NONE) => {
+                    state.notice = None;
+                    state.confirm_apply = true;
+                }
+                _ => {}
+            }
+            if selection_moved {
+                state.scroll = 0;
+                state.notice = None;
+            }
+        }
+        if selection_moved {
+            self.request_selected_diff();
         }
         true
     }
@@ -1074,6 +1356,230 @@ mod tests {
     fn task_kind_command_autoremove_is_noninteractive() {
         let cmd = TaskKind::AutoRemove.command(false);
         assert!(cmd.contains("DEBIAN_FRONTEND=noninteractive"));
+    }
+
+    /// A changed conffile makes dpkg prompt on stdin, which hangs the task
+    /// forever over SSH. Every dpkg-invoking command must defuse that.
+    #[test]
+    fn dpkg_invoking_commands_never_prompt_on_conffiles() {
+        let cmds = [
+            TaskKind::Upgrade.command(false),
+            TaskKind::UpgradeSecurity(vec!["openssh-server".to_string()]).command(false),
+            TaskKind::FullUpgrade.command(false),
+            TaskKind::AutoRemove.command(false),
+        ];
+        for cmd in cmds {
+            assert!(cmd.contains("--force-confdef"), "missing confdef: {cmd}");
+            assert!(cmd.contains("--force-confold"), "missing confold: {cmd}");
+            assert!(cmd.contains("</dev/null"), "stdin still open: {cmd}");
+        }
+    }
+
+    // ── Pending conffiles ─────────────────────────────────────────────────────
+
+    fn pending_conffile(live: &str) -> PendingConffile {
+        PendingConffile {
+            pending_path: format!("{live}.dpkg-dist"),
+            live_path: live.to_string(),
+            package: None,
+        }
+    }
+
+    #[test]
+    fn keep_conffile_removes_only_the_pending_file() {
+        let cmd = TaskKind::KeepConffile(pending_conffile("/etc/ssh/sshd_config")).command(true);
+        assert!(cmd.contains("sudo -n rm -f -- '/etc/ssh/sshd_config.dpkg-dist'"));
+        // The live config must not appear as an argument to rm.
+        assert!(!cmd.contains("rm -f -- '/etc/ssh/sshd_config'"));
+    }
+
+    #[test]
+    fn apply_conffile_backs_up_before_replacing() {
+        let cmd = TaskKind::ApplyConffile(pending_conffile("/etc/ssh/sshd_config")).command(true);
+        let backup = cmd
+            .find("cp -a --")
+            .expect("apply must copy the live file first");
+        let install = cmd.find("mv --").expect("apply must move the new file in");
+        assert!(backup < install, "backup has to happen before the move");
+        assert!(cmd.contains("'/etc/ssh/sshd_config.dpkg-old'"));
+        // `set -e` is what makes a failed backup abort the move.
+        assert!(cmd.starts_with("set -e;"));
+    }
+
+    /// Paths come from `find` on the remote host, so a filename containing a
+    /// quote must not be able to break out into a second command.
+    #[test]
+    fn conffile_commands_quote_hostile_paths() {
+        let nasty = PendingConffile {
+            pending_path: "/etc/x'; rm -rf /; '.dpkg-dist".to_string(),
+            live_path: "/etc/x'; rm -rf /; '".to_string(),
+            package: None,
+        };
+        for cmd in [
+            TaskKind::KeepConffile(nasty.clone()).command(false),
+            TaskKind::ApplyConffile(nasty.clone()).command(false),
+        ] {
+            assert!(
+                !cmd.contains("; rm -rf /; '.dpkg-dist'"),
+                "path escaped quoting: {cmd}"
+            );
+            assert!(cmd.contains(r#"'\''"#), "expected escaped quotes in {cmd}");
+            // Every occurrence of the path — including inside progress echoes
+            // — has to be quoted, so the raw form must never appear.
+            assert!(
+                !cmd.contains("/etc/x'; rm"),
+                "unquoted path reached the command: {cmd}"
+            );
+        }
+    }
+
+    fn app_with_pending_conffiles(files: Vec<PendingConffile>) -> App {
+        let mut app = make_app(RawConfig {
+            defaults: Defaults {
+                user: Some("alice".to_string()),
+                ..Default::default()
+            },
+            // Opening the modal kicks off a real diff fetch in the background.
+            // `.invalid` is guaranteed never to resolve (RFC 6761), so that
+            // connection fails immediately instead of stalling runtime
+            // shutdown on a DNS timeout.
+            hosts: vec![raw_host("web01.invalid")],
+            ..Default::default()
+        });
+        app.hosts[0].info = Some(HostInfo {
+            pending_conffiles: files,
+            ..Default::default()
+        });
+        app.hosts[0].status = HostStatus::Ready;
+        app
+    }
+
+    #[tokio::test]
+    async fn c_opens_review_modal_when_files_are_pending() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.conffile_review.is_some());
+    }
+
+    /// `c` opening the review modal must not shadow Ctrl-C quitting.
+    #[tokio::test]
+    async fn ctrl_c_still_quits_rather_than_opening_the_modal() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        let keep_running = app.handle_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!keep_running);
+        assert!(app.conffile_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn c_does_nothing_when_nothing_is_pending() {
+        let mut app = app_with_pending_conffiles(vec![]);
+        app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.conffile_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn review_modal_navigates_between_files() {
+        let mut app = app_with_pending_conffiles(vec![
+            pending_conffile("/etc/a.conf"),
+            pending_conffile("/etc/b.conf"),
+        ]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.conffile_review.as_ref().unwrap().selected, 1);
+        // Selection stops at the end rather than wrapping onto a missing file.
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.conffile_review.as_ref().unwrap().selected, 1);
+        app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.conffile_review.as_ref().unwrap().selected, 0);
+    }
+
+    /// Applying overwrites a live config, so a single stray keypress must not
+    /// be enough to do it.
+    #[tokio::test]
+    async fn apply_requires_confirmation() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.open_conffile_review(0);
+
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(app.conffile_review.as_ref().unwrap().confirm_apply);
+        assert!(app.hosts[0].task.is_none(), "no task before confirming");
+
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert!(!app.conffile_review.as_ref().unwrap().confirm_apply);
+        assert!(app.hosts[0].task.is_none(), "cancelling must not act");
+
+        app.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.conffile_review.is_none(), "modal closes once acted on");
+        assert!(matches!(
+            app.hosts[0].task.as_ref().map(|t| &t.kind),
+            Some(TaskKind::ApplyConffile(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn discard_acts_immediately() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(app.conffile_review.is_none());
+        assert!(matches!(
+            app.hosts[0].task.as_ref().map(|t| &t.kind),
+            Some(TaskKind::KeepConffile(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn esc_closes_review_modal_without_acting() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.open_conffile_review(0);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.conffile_review.is_none());
+        assert!(app.hosts[0].task.is_none());
+    }
+
+    /// Only one task per host can run, so an action taken while one is in
+    /// flight would be silently dropped — the modal says so instead.
+    #[tokio::test]
+    async fn review_refuses_to_act_while_a_task_runs() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.open_conffile_review(0);
+        app.hosts[0].task = Some(TaskState::new(TaskKind::Update));
+
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let state = app
+            .conffile_review
+            .as_ref()
+            .expect("modal stays open on refusal");
+        assert!(state.notice.is_some());
+        assert!(matches!(
+            app.hosts[0].task.as_ref().map(|t| &t.kind),
+            Some(TaskKind::Update)
+        ));
+    }
+
+    #[tokio::test]
+    async fn diff_for_a_closed_modal_is_discarded() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.handle_message(AppMessage::ConffileDiff {
+            host_idx: 0,
+            pending_path: "/etc/hosts.dpkg-dist".to_string(),
+            result: Ok(vec!["-a".to_string(), "+b".to_string()]),
+        });
+        assert!(app.conffile_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn diff_result_lands_on_the_open_modal() {
+        let mut app = app_with_pending_conffiles(vec![pending_conffile("/etc/hosts")]);
+        app.open_conffile_review(0);
+        app.handle_message(AppMessage::ConffileDiff {
+            host_idx: 0,
+            pending_path: "/etc/hosts.dpkg-dist".to_string(),
+            result: Ok(vec!["-a".to_string(), "+b".to_string()]),
+        });
+        let state = app.conffile_review.as_ref().unwrap();
+        assert!(matches!(state.selected_diff(), Some(DiffState::Loaded(l)) if l.len() == 2));
     }
 
     #[test]

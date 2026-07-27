@@ -34,6 +34,24 @@ pub struct RcPackage {
     pub name: String,
 }
 
+/// A config file that a package shipped a new version of, which dpkg left
+/// beside the live file rather than installing (because aptmatic upgrades with
+/// `--force-confold`). Nothing has changed on the host until it is resolved.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingConffile {
+    /// What dpkg wrote, e.g. `/etc/ssh/sshd_config.dpkg-dist`.
+    pub pending_path: String,
+    /// The live config it would replace, e.g. `/etc/ssh/sshd_config`.
+    pub live_path: String,
+    /// Package owning the live path, when dpkg can attribute it.
+    pub package: Option<String>,
+}
+
+/// Suffixes dpkg and ucf use for "here is the new version, you decide".
+/// `.dpkg-old` is deliberately absent: that is a backup of the *previous*
+/// file, not a pending change.
+const PENDING_SUFFIXES: &[&str] = &[".dpkg-dist", ".dpkg-new", ".ucf-dist"];
+
 /// All gathered information for a single host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostInfo {
@@ -44,6 +62,9 @@ pub struct HostInfo {
     pub rc_packages: Vec<RcPackage>,
     pub held_packages: Vec<HeldPackage>,
     pub autoremovable: Vec<String>,
+    /// Defaulted so that caches written before this field existed still load.
+    #[serde(default)]
+    pub pending_conffiles: Vec<PendingConffile>,
 }
 
 impl HostInfo {
@@ -59,6 +80,52 @@ impl HostInfo {
             .filter(|p| p.is_security)
             .map(|p| p.name.clone())
             .collect()
+    }
+}
+
+/// Parse the output of the `find` in `gather::gather` that locates pending
+/// conffiles. One path per line; anything without a recognised suffix is
+/// ignored. Results are sorted so the review list is stable between gathers.
+pub fn parse_pending_conffiles(output: &str) -> Vec<PendingConffile> {
+    let mut files: Vec<PendingConffile> = output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .filter_map(|path| {
+            let suffix = PENDING_SUFFIXES.iter().find(|s| path.ends_with(**s))?;
+            Some(PendingConffile {
+                pending_path: path.to_string(),
+                live_path: path[..path.len() - suffix.len()].to_string(),
+                package: None,
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.pending_path.cmp(&b.pending_path));
+    files
+}
+
+/// Attach owning packages using the output of `dpkg -S <live paths…>`, whose
+/// lines look like `openssh-server: /etc/ssh/sshd_config`. Paths dpkg cannot
+/// attribute (it writes those to stderr) simply keep `package: None`.
+pub fn attach_conffile_owners(files: &mut [PendingConffile], dpkg_search_output: &str) {
+    for line in dpkg_search_output.lines() {
+        let Some((pkgs, path)) = line.rsplit_once(": ") else {
+            continue;
+        };
+        let path = path.trim();
+        // Diversions render as `diversion by x from: /path`; those have no
+        // package name to offer, and `pkgs` would be nonsense.
+        if pkgs.contains(char::is_whitespace) {
+            continue;
+        }
+        // A path can be shipped by several packages, listed comma-separated.
+        let owner = pkgs.split(',').next().unwrap_or(pkgs).trim();
+        if owner.is_empty() {
+            continue;
+        }
+        for f in files.iter_mut().filter(|f| f.live_path == path) {
+            f.package = Some(owner.to_string());
+        }
     }
 }
 
@@ -236,6 +303,72 @@ pub fn parse_autoremovable(output: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_pending_conffiles ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_pending_conffiles_empty() {
+        assert!(parse_pending_conffiles("").is_empty());
+    }
+
+    #[test]
+    fn parse_pending_conffiles_derives_live_path_per_suffix() {
+        let input =
+            "/etc/ssh/sshd_config.dpkg-dist\n/etc/sysctl.conf.dpkg-new\n/etc/foo.ucf-dist\n";
+        let files = parse_pending_conffiles(input);
+        assert_eq!(files.len(), 3);
+        let live: Vec<&str> = files.iter().map(|f| f.live_path.as_str()).collect();
+        assert!(live.contains(&"/etc/ssh/sshd_config"));
+        assert!(live.contains(&"/etc/sysctl.conf"));
+        assert!(live.contains(&"/etc/foo"));
+    }
+
+    /// `.dpkg-old` is the backup of the file that was replaced — there is
+    /// nothing pending about it, and offering to "apply" it would restore an
+    /// old config.
+    #[test]
+    fn parse_pending_conffiles_ignores_dpkg_old_backups() {
+        let input = "/etc/ssh/sshd_config.dpkg-old\n/etc/hosts\n";
+        assert!(parse_pending_conffiles(input).is_empty());
+    }
+
+    #[test]
+    fn parse_pending_conffiles_sorted_for_stable_ordering() {
+        let input = "/etc/z.conf.dpkg-dist\n/etc/a.conf.dpkg-dist\n";
+        let files = parse_pending_conffiles(input);
+        assert_eq!(files[0].pending_path, "/etc/a.conf.dpkg-dist");
+        assert_eq!(files[1].pending_path, "/etc/z.conf.dpkg-dist");
+    }
+
+    // ── attach_conffile_owners ────────────────────────────────────────────────
+
+    #[test]
+    fn attach_conffile_owners_matches_live_path() {
+        let mut files = parse_pending_conffiles("/etc/ssh/sshd_config.dpkg-dist");
+        attach_conffile_owners(&mut files, "openssh-server: /etc/ssh/sshd_config\n");
+        assert_eq!(files[0].package.as_deref(), Some("openssh-server"));
+    }
+
+    #[test]
+    fn attach_conffile_owners_takes_first_of_several_packages() {
+        let mut files = parse_pending_conffiles("/etc/shared.conf.dpkg-dist");
+        attach_conffile_owners(&mut files, "pkg-a,pkg-b: /etc/shared.conf\n");
+        assert_eq!(files[0].package.as_deref(), Some("pkg-a"));
+    }
+
+    #[test]
+    fn attach_conffile_owners_skips_diversion_lines() {
+        let mut files = parse_pending_conffiles("/etc/foo.conf.dpkg-dist");
+        attach_conffile_owners(&mut files, "diversion by other from: /etc/foo.conf\n");
+        assert!(files[0].package.is_none());
+    }
+
+    #[test]
+    fn attach_conffile_owners_leaves_unmatched_paths_alone() {
+        let mut files = parse_pending_conffiles("/etc/foo.conf.dpkg-dist");
+        attach_conffile_owners(&mut files, "somepkg: /etc/unrelated.conf\n");
+        assert!(files[0].package.is_none());
+    }
 
     // ── parse_upgradable ──────────────────────────────────────────────────────
 

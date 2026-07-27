@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
-use crate::app::{App, HostStatus, TaskStatus};
+use crate::app::{App, DiffState, HostStatus, TaskStatus};
 use crate::apt::HoldReason;
 use crate::config::SidebarRow;
 
@@ -48,6 +48,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
     }
 
+    if app.conffile_review.is_some() {
+        render_conffile_review_modal(f, app);
+    }
+
     if let Some(state) = &app.reboot_confirm {
         let hostname = app.hosts[state.host_idx].cfg.hostname.clone();
         render_reboot_confirm_modal(f, &hostname, &state.input, state.mismatch);
@@ -82,7 +86,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let line1 = format!(
         "{refresh_status}r:update+refresh  R:update+refresh all  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all  s:sec-upgrade  S:sec-upgrade all"
     );
-    let line2 = " a:autoremove  A:autoremove all  p:purge-rc  b:reboot  t:task output  z:zoom  /:search  q:quit";
+    let line2 = " a:autoremove  A:autoremove all  p:purge-rc  c:config files  b:reboot  t:task output  z:zoom  /:search  q:quit";
     let text = vec![
         Line::from(Span::raw(format!(" {line1}"))),
         Line::from(Span::raw(line2)),
@@ -156,6 +160,19 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Span::raw("")
                 };
+                let conffile_count = h
+                    .info
+                    .as_ref()
+                    .map(|i| i.pending_conffiles.len())
+                    .unwrap_or(0);
+                let conffile_badge = if conffile_count > 0 {
+                    Span::styled(
+                        format!(" [{conffile_count} cfg]"),
+                        Style::default().fg(Color::Magenta),
+                    )
+                } else {
+                    Span::raw("")
+                };
                 let reboot_required = h.info.as_ref().map(|i| i.reboot_required).unwrap_or(false);
                 let reboot_needed_badge = if reboot_required {
                     Span::raw(" [R]")
@@ -170,6 +187,7 @@ fn render_sidebar(f: &mut Frame, app: &App, area: Rect) {
                     kernel_badge,
                     update_count_badge,
                     security_badge,
+                    conffile_badge,
                     reboot_needed_badge,
                 ]))
             }
@@ -437,6 +455,31 @@ fn render_upgradable_panel(f: &mut Frame, h: &crate::app::HostState, area: Rect)
                 reason,
             ]));
         }
+    }
+
+    if !info.pending_conffiles.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(section_header(&format!(
+            "Pending config files ({})",
+            info.pending_conffiles.len()
+        )));
+        for f in &info.pending_conffiles {
+            let owner = f
+                .package
+                .as_deref()
+                .map(|p| format!(" [{p}]"))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}", f.live_path)),
+                Span::styled(owner, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "  Press c to review",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     if !info.rc_packages.is_empty() {
@@ -721,6 +764,157 @@ fn render_quit_confirm_modal(f: &mut Frame, running: usize) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Style a unified-diff line the way `git diff` does, so the eye can pick out
+/// what the package wants to change without reading every line.
+fn diff_line(raw: &str) -> Line<'_> {
+    let style = if raw.starts_with("+++") || raw.starts_with("---") {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if raw.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else if raw.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if raw.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(Span::styled(raw, style))
+}
+
+fn render_conffile_review_modal(f: &mut Frame, app: &App) {
+    let Some(state) = &app.conffile_review else {
+        return;
+    };
+    let area = f.area();
+    let modal_area = centered_rect(
+        area.width.saturating_sub(6).max(40),
+        area.height.saturating_sub(4).max(12),
+        area,
+    );
+    f.render_widget(Clear, modal_area);
+
+    let hostname = &app.hosts[state.host_idx].cfg.hostname;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" Pending config files — {hostname} "),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    // File list gets a third of the height, capped so a long list can't crowd
+    // out the diff entirely.
+    let list_height = (state.files.len() as u16 + 1).min(inner.height / 3).max(2);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(list_height),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let items: Vec<ListItem> = state
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let marker = if i == state.selected { " > " } else { "   " };
+            let owner = file
+                .package
+                .as_deref()
+                .map(|p| format!("  [{p}]"))
+                .unwrap_or_default();
+            ListItem::new(Line::from(vec![
+                Span::raw(marker.to_string()),
+                Span::styled(file.pending_path.clone(), Style::default().fg(Color::White)),
+                Span::styled(owner, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selected));
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, chunks[0], &mut list_state);
+
+    let diff_block = Block::default().borders(Borders::TOP);
+    let diff_area = diff_block.inner(chunks[1]);
+    f.render_widget(diff_block, chunks[1]);
+
+    match state.selected_diff() {
+        Some(DiffState::Loaded(lines)) if lines.is_empty() => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " no differences — the new file matches the live one",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                diff_area,
+            );
+        }
+        Some(DiffState::Loaded(lines)) => {
+            let text: Vec<Line> = lines.iter().map(|l| diff_line(l)).collect();
+            let max_scroll = (text.len() as u16).saturating_sub(diff_area.height);
+            f.render_widget(
+                Paragraph::new(text).scroll((state.scroll.min(max_scroll), 0)),
+                diff_area,
+            );
+        }
+        Some(DiffState::Failed(e)) => {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" diff failed: {e}"),
+                    Style::default().fg(Color::Red),
+                ))),
+                diff_area,
+            );
+        }
+        _ => {
+            let spinner = SPINNER[(app.tick / 2) as usize % SPINNER.len()];
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(" {spinner} loading diff…"),
+                    Style::default().fg(Color::Yellow),
+                ))),
+                diff_area,
+            );
+        }
+    }
+
+    let footer = if state.confirm_apply {
+        let live = state
+            .selected_file()
+            .map(|f| f.live_path.as_str())
+            .unwrap_or("");
+        Line::from(Span::styled(
+            format!(
+                " Replace {live} with the new version (old kept as .dpkg-old)?  y: confirm   any other key: cancel"
+            ),
+            Style::default().bg(Color::Red).fg(Color::White),
+        ))
+    } else if let Some(notice) = &state.notice {
+        Line::from(Span::styled(
+            format!(" ⚠ {notice}"),
+            Style::default().bg(Color::DarkGray).fg(Color::Yellow),
+        ))
+    } else {
+        Line::from(Span::styled(
+            " ↑/↓:file  PgUp/PgDn:scroll  d:discard new (keep current)  a:apply new  Esc:close",
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ))
+    };
+    f.render_widget(Paragraph::new(footer), chunks[2]);
+}
+
 fn render_reboot_confirm_modal(f: &mut Frame, hostname: &str, input: &str, mismatch: bool) {
     let area = f.area();
     let modal_area = centered_rect(60.min(area.width), 11.min(area.height), area);
@@ -779,4 +973,113 @@ fn render_reboot_confirm_modal(f: &mut Frame, hostname: &str, input: &str, misma
     )));
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, ConffileReviewState, DiffState};
+    use crate::apt::{HostInfo, PendingConffile};
+    use crate::config::{Config, Defaults, RawConfig, RawHost};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn app_with_review(diff: DiffState) -> App {
+        let raw = RawConfig {
+            defaults: Defaults {
+                user: Some("alice".to_string()),
+                ..Default::default()
+            },
+            hosts: vec![RawHost {
+                hostname: "web01.invalid".to_string(),
+                user: None,
+                port: None,
+                use_sudo: None,
+                identity_file: None,
+            }],
+            ..Default::default()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Config { raw }, tx);
+        let files: Vec<PendingConffile> = (0..8)
+            .map(|i| PendingConffile {
+                pending_path: format!("/etc/service{i}/config.conf.dpkg-dist"),
+                live_path: format!("/etc/service{i}/config.conf"),
+                package: Some(format!("package-{i}")),
+            })
+            .collect();
+        app.hosts[0].info = Some(HostInfo {
+            pending_conffiles: files.clone(),
+            ..Default::default()
+        });
+        let mut diffs = std::collections::HashMap::new();
+        diffs.insert(files[0].pending_path.clone(), diff);
+        app.conffile_review = Some(ConffileReviewState {
+            host_idx: 0,
+            files,
+            selected: 0,
+            diffs,
+            scroll: 0,
+            confirm_apply: false,
+            notice: None,
+        });
+        app
+    }
+
+    fn draw_at(app: &mut App, width: u16, height: u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+    }
+
+    /// The review modal sizes itself from the terminal, so it has to survive
+    /// being drawn into one far smaller than its content.
+    #[test]
+    fn review_modal_renders_at_any_terminal_size() {
+        let diff = DiffState::Loaded(
+            (0..200)
+                .map(|i| format!("+ line {i} of a very long configuration file diff"))
+                .collect(),
+        );
+        for (w, h) in [(1, 1), (10, 3), (40, 10), (80, 24), (200, 60)] {
+            draw_at(&mut app_with_review(diff.clone()), w, h);
+        }
+    }
+
+    #[test]
+    fn review_modal_renders_every_diff_state() {
+        for diff in [
+            DiffState::Loading,
+            DiffState::Loaded(vec![]),
+            DiffState::Failed("permission denied".to_string()),
+        ] {
+            draw_at(&mut app_with_review(diff), 80, 24);
+        }
+    }
+
+    #[test]
+    fn review_modal_renders_confirm_and_notice_footers() {
+        let mut app = app_with_review(DiffState::Loaded(vec!["-old".into(), "+new".into()]));
+        app.conffile_review.as_mut().unwrap().confirm_apply = true;
+        draw_at(&mut app, 80, 24);
+
+        let state = app.conffile_review.as_mut().unwrap();
+        state.confirm_apply = false;
+        state.notice = Some("a task is already running on this host".to_string());
+        draw_at(&mut app, 80, 24);
+    }
+
+    /// A scroll offset left over from a longer diff must not index past a
+    /// shorter one.
+    #[test]
+    fn review_modal_clamps_stale_scroll_offset() {
+        let mut app = app_with_review(DiffState::Loaded(vec!["-old".into(), "+new".into()]));
+        app.conffile_review.as_mut().unwrap().scroll = 5_000;
+        draw_at(&mut app, 80, 24);
+    }
+
+    #[test]
+    fn sidebar_and_detail_render_with_pending_conffiles() {
+        let mut app = app_with_review(DiffState::Loading);
+        app.conffile_review = None;
+        draw_at(&mut app, 80, 24);
+    }
 }

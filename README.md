@@ -24,8 +24,8 @@ A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts �
 ╰─────────────────────────────────────────────────────────────────╯
  r:update+refresh  R:refresh all  u:upgrade  U:upgrade all
  f:full-upgrade  F:full-upgrade all  s:sec-upgrade  S:sec-upgrade all
- a:autoremove  A:autoremove all  p:purge-rc  b:reboot  t:task output
- z:zoom  /:search  q:quit
+ a:autoremove  A:autoremove all  p:purge-rc  c:config files  b:reboot
+ t:task output  z:zoom  /:search  q:quit
 ```
 
 ## Features
@@ -41,6 +41,9 @@ A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts �
 - 💾 **Cached last-known state** — the dashboard isn't blank on startup while it reconnects
 - 🚦 **Bounded connection concurrency** — "all hosts" actions queue instead of opening a connection per host at once
 - 🧹 **RC package purging** — one key to purge all those half-removed ghosts
+- 📝 **Pending config files** — upgrades never stop to ask about a changed conffile; the new version is counted per host and reviewed later, with a diff, on your schedule
+- ⬆️ **Full-upgrade & autoremove** — `apt-get full-upgrade` and `apt-get autoremove --purge`, on selected hosts or the whole fleet
+- 🔁 **Confirmed reboot** — type the hostname to confirm before a host goes down
 - 🖱️ **Draggable divider** — because you deserve to customise your own TUI
 - 🦀 **Written in Rust** — guaranteed\* to have no bugs
 
@@ -93,18 +96,38 @@ hostname = "db1.example.com"
 | `↑` / `k` | Move up |
 | `↓` / `j` | Move down |
 | `/` | Search/filter the sidebar by hostname or group name |
-| `r` | Refresh selected host(s) |
-| `R` | Refresh **all** hosts |
-| `u` | `apt-get update` on selected |
-| `U` | `apt-get upgrade` on selected |
+| `r` | `apt-get update` + refresh on selected |
+| `R` | `apt-get update` + refresh on **all** hosts |
+| `u` | `apt-get upgrade` on selected |
+| `U` | `apt-get upgrade` on **all** hosts |
+| `f` | `apt-get full-upgrade` on selected |
+| `F` | `apt-get full-upgrade` on **all** hosts |
 | `s` | Upgrade **security-only** packages on selected |
 | `S` | Upgrade **security-only** packages on **all** hosts |
+| `a` | `apt-get autoremove --purge` on selected |
+| `A` | `apt-get autoremove --purge` on **all** hosts |
 | `p` | Purge RC packages on selected |
+| `c` | Review pending config files on the selected host |
+| `b` | Reboot the selected host (type the hostname to confirm) |
 | `t` / `Enter` | View live task output |
 | `z` | Zoom — hide sidebar for clean copy/paste |
 | `q` / `Esc` | Quit |
 
 The sidebar divider is also mouse-draggable if you're feeling fancy.
+
+### Pending config files
+
+Upgrades run with `--force-confdef --force-confold`, so dpkg never stops to ask what to do about a config file you've edited — it keeps yours and drops the maintainer's version next to it as `.dpkg-dist`. Hosts carrying unresolved files show a `[n cfg]` badge in the sidebar; `c` opens a review pane listing them with a diff against the live file:
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Select a file |
+| `PgUp` / `PgDn` | Scroll the diff |
+| `d` | Discard the new version, keeping your current config |
+| `a` | Install the new version, backing your current one up to `.dpkg-old` (asks first) |
+| `Esc` | Close |
+
+Applying a config file does not restart anything — restart the affected service yourself once you're happy with it.
 
 While searching, type to filter, `↑`/`↓` to jump between matches, `Enter`/`Esc` to stop editing (the filter stays applied — clear it by backspacing to empty).
 

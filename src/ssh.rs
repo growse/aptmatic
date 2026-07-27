@@ -11,6 +11,13 @@ pub struct SshSession {
     session: Session,
 }
 
+/// Wrap a string so the remote shell sees it as one literal word. Paths we
+/// interpolate into commands come from `find` output on the host, so they can
+/// contain spaces, quotes, or anything else a filename is allowed to hold.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r#"'\''"#))
+}
+
 impl SshSession {
     /// Connect to a host, verify its key, and authenticate.
     pub fn connect(cfg: &HostConfig) -> Result<Self> {
@@ -37,6 +44,7 @@ impl SshSession {
     pub fn exec(&self, cmd: &str) -> Result<String> {
         let mut channel = self.session.channel_session().context("open channel")?;
         channel.exec(cmd).with_context(|| format!("exec: {cmd}"))?;
+        close_stdin(&mut channel);
         let mut out = String::new();
         channel.read_to_string(&mut out).context("read stdout")?;
         channel.wait_close().context("wait close")?;
@@ -47,6 +55,7 @@ impl SshSession {
     pub fn exec_streaming(&self, cmd: &str, mut on_line: impl FnMut(String)) -> Result<i32> {
         let mut channel = self.session.channel_session().context("open channel")?;
         channel.exec(cmd).with_context(|| format!("exec: {cmd}"))?;
+        close_stdin(&mut channel);
 
         let mut buf = String::new();
         let mut raw = [0u8; 4096];
@@ -73,6 +82,14 @@ impl SshSession {
         channel.wait_close().context("wait close")?;
         channel.exit_status().context("exit status")
     }
+}
+
+/// Signal EOF on the channel's stdin. We never write to a command, and anything
+/// that does try to read (a dpkg prompt that slipped past `--force-conf*`) must
+/// see EOF rather than block forever waiting on an open channel. Best-effort:
+/// failing to send EOF is not a reason to abandon the command.
+fn close_stdin(channel: &mut ssh2::Channel) {
+    let _ = channel.send_eof();
 }
 
 fn verify_host_key(session: &Session, hostname: &str, port: u16) -> Result<()> {
