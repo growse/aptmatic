@@ -7,25 +7,36 @@
 A snappy terminal UI for wrangling `apt` across a fleet of Debian/Ubuntu hosts — written in Rust, because I don't know how to code in OCaml.
 
 ```
-╭─ aptmatic ──────────────────────────────────────────────────────╮
-│ Hosts          │Detail                                          │
-│ ▸ webservers   │web1.example.com                                │
-│    ● web1  [2] │user: ubuntu  port: 22  sudo: true              │
-│    ● web2      │                                                │
-│ ▸ databases    │Status: 2 upgrade(s) available (1 security)     │
-│    ⠼ db1       │                                                │
-│    ● db2       │Kernel                                          │
-│                │Running: 6.1.0-28-amd64                         │
-│                │Latest:  linux-image-6.1.0-32-amd64 ← reboot    │
-│                │                                                │
-│                │Upgradable                                      │
-│                │[sec] curl (7.88.1-10 → 7.88.1-10+deb12u8)      │
-│                │      libcurl4 (7.88.1-10 → 7.88.1-10+deb12u8)  │
-╰─────────────────────────────────────────────────────────────────╯
- r:update+refresh  R:refresh all  u:upgrade  U:upgrade all
- f:full-upgrade  F:full-upgrade all  s:sec-upgrade  S:sec-upgrade all
- a:autoremove  A:autoremove all  p:purge-rc  c:config files  b:reboot
- t:task output  z:zoom  /:search  q:quit
+ aptmatic — apt manager
+Hosts                                              │┌ Detail ────────────────────────────────────────────────────────────────────────────────┐
+ ▸ webservers                                      ││┌──────────────────────────────────────────────────────────────────────────────────────┐│
+   ● web1 [6.1.0-28-amd64] [4] [2 sec] [1 cfg] [R] │││ web1   user: ubuntu  port: 22  sudo: true                                            ││
+   ● web2 [6.1.0-32-amd64]                         ││└──────────────────────────────────────────────────────────────────────────────────────┘│
+ ▸ databases                                       ││┌ Kernel ──────────────────────────────────────────────────────────────────────────────┐│
+   ⠋ db1                                           │││ Running: 6.1.0-28-amd64                                                              ││
+   ✗ db2                                           │││ Latest:  6.1.0-32-amd64 ← reboot to activate                                         ││
+                                                   │││ ⚠ Reboot required                                                                    ││
+                                                   │││                                                                                      ││
+                                                   ││└──────────────────────────────────────────────────────────────────────────────────────┘│
+                                                   ││┌ Upgradable (4, 2 security) ─────────────────────────────┐┌ Autoremovable (2) ────────┐│
+                                                   │││ libc-bin (2.36-9+deb12u9 →) 2.36-9+deb12u10 [security]  ││ linux-image-6.1.0-25-amd64││
+                                                   │││ libc6 (2.36-9+deb12u9 →) 2.36-9+deb12u10 [security]     ││ libllvm14                 ││
+                                                   │││ nginx (1.22.1-9 →) 1.22.1-9+deb12u1                     ││                           ││
+                                                   │││ tzdata (2025a-0+deb12u1 →) 2025b-0+deb12u1              ││                           ││
+                                                   │││                                                         ││                           ││
+                                                   │││ Held / kept back (1)                                    ││                           ││
+                                                   │││  postgresql-15 [manual hold]                            ││                           ││
+                                                   │││                                                         ││                           ││
+                                                   │││ Pending config files (1)                                ││                           ││
+                                                   │││  /etc/nginx/nginx.conf [nginx-common]                   ││                           ││
+                                                   │││  Press c to review                                      ││                           ││
+                                                   ││└─────────────────────────────────────────────────────────┘└───────────────────────────┘│
+                                                   ││┌ Task output: none ───────────────────────────────────────────────────────────────────┐│
+                                                   │││                                                                                      ││
+                                                   ││└──────────────────────────────────────────────────────────────────────────────────────┘│
+                                                   │└────────────────────────────────────────────────────────────────────────────────────────┘
+  [1 refreshing…]  r:update+refresh  R:update+refresh all  u:upgrade  U:upgrade all  f:full-upgrade  F:full-upgrade all  s:sec-upgrade  S:sec-
+ a:autoremove  A:autoremove all  p:purge-rc  c:config files  b:reboot  t:task output  z:zoom  /:search  q:quit
 ```
 
 ## Features
